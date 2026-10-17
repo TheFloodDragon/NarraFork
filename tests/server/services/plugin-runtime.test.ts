@@ -11,7 +11,9 @@ import {
 	type PluginProcessSpawner,
 	type PluginRunner,
 	PluginRuntime,
+	PluginRuntimeError,
 	type RunnerProcess,
+	type RunnerStartOptions,
 	RuntimeSupervisor,
 	type RuntimeSupervisorOptions,
 } from "../../../server/services/plugin-runtime";
@@ -228,13 +230,16 @@ class FakeProcessHandle implements PluginProcessHandle {
 
 class FakeRunner implements PluginRunner {
 	readonly handles: FakeProcessHandle[] = [];
+	/** Start options per spawned handle, so tests can drive host-side hooks. */
+	readonly startOptions: RunnerStartOptions[] = [];
 
 	constructor(
 		private readonly mode: "response" | "notification" = "response",
 		private readonly errorMethod?: LifecycleMethod,
 	) {}
 
-	async start(): Promise<PluginProcessHandle> {
+	async start(options: RunnerStartOptions): Promise<PluginProcessHandle> {
+		this.startOptions.push(options);
 		const handle = new FakeProcessHandle(this.mode, this.errorMethod);
 		this.handles.push(handle);
 		setTimeout(() => {
@@ -438,6 +443,27 @@ describe("LocalProcessRunner", () => {
 		expect(command.slice(6)).toEqual(["bun", fixturePath]);
 	});
 
+	it("reports an idle reclamation before terminating the process", async () => {
+		const raw = makeRawProcess();
+		const events: string[] = [];
+		const runner = new LocalProcessRunner({
+			spawn: () => raw.process,
+			allowUnboundedResourceUsage: true,
+			idleTimeoutMs: 5,
+		});
+		await runner.start({
+			command: ["fixture"],
+			cwd: fixtureCwd,
+			onIdleTimeout: () => events.push("idle"),
+			onError: (error) =>
+				events.push(error instanceof PluginRuntimeError ? (error.code ?? "error") : "error"),
+		});
+		await eventually(() => raw.wasKilled());
+		// The hook must run before the transport reports the kill: the runtime uses it
+		// to classify the stop as host-initiated rather than a plugin crash.
+		expect(events).toEqual(["idle", "IDLE_TIMEOUT"]);
+	});
+
 	it("fails closed on Windows unless an external sandbox is explicitly declared", async () => {
 		const raw = makeRawProcess();
 		const blocked = new LocalProcessRunner({ platform: "win32", spawn: () => raw.process });
@@ -619,6 +645,67 @@ describe("RuntimeSupervisor", () => {
 			h.runner.handles[1].finish(1);
 			expect(runtime.state).toBe("quarantine");
 			expect(h.scheduled()).toHaveLength(1);
+		} finally {
+			await h.cleanup();
+		}
+	});
+
+	it("treats a host idle reclaim as a stop instead of a crash to recover", async () => {
+		const h = recoveryHarness();
+		try {
+			const states: string[] = [];
+			const runtime = await h.supervisor.start({
+				...baseRuntimeOptions,
+				runner: h.runner,
+				onStateChange: (state) => states.push(state),
+			});
+			const handle = h.runner.handles[0];
+			// LocalProcessHandleImpl fires the hook, then reports the timeout error, then
+			// kills the process — reproduce that order rather than only the final exit.
+			h.runner.startOptions[0].onIdleTimeout?.();
+			handle.emitError(
+				new PluginRuntimeError("Plugin runtime idle timeout", {
+					code: "IDLE_TIMEOUT",
+					phase: "idle",
+					kind: "timeout",
+					retryable: true,
+				}),
+			);
+			handle.finish(137);
+			expect(runtime.state).toBe("stopped");
+			expect(states).not.toContain("crashed");
+			expect(states).not.toContain("failed");
+			// A host stop is not a failure: no backoff timer, no budget consumption.
+			expect(h.scheduled()).toHaveLength(0);
+			expect(runtime.getDiagnostics().restartCount).toBe(0);
+
+			// The next on-demand activation starts a fresh generation on the same object.
+			await h.supervisor.start(runtime.pluginId);
+			expect(runtime.state).toBe("active");
+			expect(runtime.generation).toBe(2);
+			// An on-demand wake-up is not a supervisor restart.
+			expect(runtime.getDiagnostics().restartCount).toBe(0);
+		} finally {
+			await h.cleanup();
+		}
+	});
+
+	it("counts supervisor restarts rather than every generation bump", async () => {
+		const h = recoveryHarness();
+		try {
+			const runtime = await h.supervisor.start({ ...baseRuntimeOptions, runner: h.runner });
+			expect(runtime.getDiagnostics().restartCount).toBe(0);
+			h.runner.handles[0].finish(1);
+			h.fire(0);
+			await eventually(() => runtime.state === "active");
+			expect(runtime.generation).toBe(2);
+			expect(runtime.getDiagnostics().restartCount).toBe(1);
+
+			// An on-demand wake-up bumps the generation but must not inflate the count.
+			await runtime.shutdown();
+			await h.supervisor.start(runtime.pluginId);
+			expect(runtime.generation).toBe(3);
+			expect(runtime.getDiagnostics().restartCount).toBe(1);
 		} finally {
 			await h.cleanup();
 		}
