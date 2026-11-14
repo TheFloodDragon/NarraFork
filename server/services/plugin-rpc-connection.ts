@@ -119,6 +119,7 @@ export interface PluginRpcOutboundPending {
 	key: string;
 	generation: number;
 	startedAt: number;
+	maxResponseBytes?: number;
 	resolve: (response: JsonRpcResponse) => void;
 	reject: (error: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
@@ -664,6 +665,7 @@ export class PluginRpcConnection {
 		options: {
 			signal?: AbortSignal;
 			timeoutMs?: number;
+			maxResponseBytes?: number;
 			id?: RpcId;
 			priority?: RpcMessagePriority;
 		} = {},
@@ -721,6 +723,9 @@ export class PluginRpcConnection {
 				key,
 				generation: this.generationValue,
 				startedAt: Date.now(),
+				...(options.maxResponseBytes === undefined
+					? {}
+					: { maxResponseBytes: positiveInteger(options.maxResponseBytes, "maxResponseBytes") }),
 				resolve: (response) =>
 					finish(() => {
 						clearTimeout(timer);
@@ -1066,6 +1071,18 @@ export class PluginRpcConnection {
 		this.outboundPending.delete(pending.key);
 		clearTimeout(pending.timer);
 		pending.removeAbort?.();
+		if (
+			pending.maxResponseBytes !== undefined &&
+			jsonBodyBytes(response) > pending.maxResponseBytes
+		) {
+			pending.reject(
+				new PluginRpcConnectionError("RPC response exceeds this request's byte limit", {
+					code: "RESPONSE_FRAME_LIMIT",
+					phase: pending.request.method,
+				}),
+			);
+			return;
+		}
 		pending.resolve(response);
 	}
 

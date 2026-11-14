@@ -32,6 +32,10 @@ import type { ProviderCatalogRefreshResult } from "./plugin-provider-catalog-ref
 import { PluginProviderCatalogRefresher } from "./plugin-provider-catalog-refresh";
 import { PluginProviderClientPool, type ProviderRuntimeLike } from "./plugin-provider-client";
 import { PluginProviderConfigService } from "./plugin-provider-config-service";
+import {
+	type PluginProviderConnectionService,
+	pluginProviderConnectionService,
+} from "./plugin-provider-connection-service";
 import { PluginProviderCredentialResolver } from "./plugin-provider-credential-resolver";
 import {
 	findPluginProviderForModel,
@@ -53,6 +57,7 @@ import {
 	type PluginPublicApiAdapters,
 	QueryRegistry,
 } from "./plugin-public-api";
+import { PluginQuotaRegistry } from "./plugin-quota-registry";
 import { RuntimeSupervisor } from "./plugin-runtime";
 import { PluginScheduler } from "./plugin-scheduler";
 import { PluginSearchRegistry } from "./plugin-search-registry";
@@ -71,6 +76,7 @@ import {
 	pluginUiSessionService as defaultPluginUiSessionService,
 	type PluginUiSessionService,
 } from "./plugin-ui-session";
+import { type ProviderQuotaService, providerQuotaService } from "./provider-quota-service";
 
 export interface PluginPlatformServices {
 	runtimeSupervisor: RuntimeSupervisor;
@@ -92,6 +98,9 @@ export interface PluginPlatformServices {
 	pluginCommandRegistry: PluginCommandRegistry;
 	mcpAdapter: PluginMcpAdapter;
 	providerRegistry: PluginProviderRegistry;
+	quotaRegistry: PluginQuotaRegistry;
+	quotaService: ProviderQuotaService;
+	providerConnectionService: PluginProviderConnectionService;
 	providerClientPool: PluginProviderClientPool;
 	providerCatalogRefresher: PluginProviderCatalogRefresher;
 	providerConfigService: PluginProviderConfigService;
@@ -126,6 +135,9 @@ export interface PluginPlatformServicesOptions {
 	pluginCommandRegistry?: PluginCommandRegistry;
 	mcpAdapter?: PluginMcpAdapter;
 	providerRegistry?: PluginProviderRegistry;
+	quotaRegistry?: PluginQuotaRegistry;
+	quotaService?: ProviderQuotaService;
+	providerConnectionService?: PluginProviderConnectionService;
 	/** Registry of `contributes.searchProviders` sources. */
 	searchRegistry?: PluginSearchRegistry;
 	providerClientPool?: PluginProviderClientPool;
@@ -285,6 +297,20 @@ function revokeProviders(
 	services.providerRegistry.disablePlugin(context.event.pluginId, lifecycleReason(context));
 }
 
+function revokeQuotas(
+	services: Partial<Pick<PluginPlatformServices, "quotaRegistry">>,
+	context: PluginLifecycleRevokeContext,
+): void {
+	const registry = services.quotaRegistry;
+	if (!registry) return;
+	if (context.action === "clear") registry.removePlugin(context.event.pluginId);
+	else if (context.action === "invalidate")
+		registry.invalidatePlugin(context.event.pluginId, {
+			runtimeOnly: context.event.kind === "runtime_generation",
+		});
+	else registry.disablePlugin(context.event.pluginId);
+}
+
 /** Build the fixed-order adapter set from the actual host-owned plugin platform services. */
 export function createPluginLifecycleRevokeAdapters(
 	services: Pick<
@@ -298,7 +324,7 @@ export function createPluginLifecycleRevokeAdapters(
 		| "mcpAdapter"
 		| "providerRegistry"
 	> &
-		Partial<Pick<PluginPlatformServices, "hostServices">>,
+		Partial<Pick<PluginPlatformServices, "hostServices" | "quotaRegistry">>,
 ): PluginLifecycleRevokeAdapters {
 	return {
 		ui_session: (context) => revokeOrClearUiSession(services, context),
@@ -309,6 +335,7 @@ export function createPluginLifecycleRevokeAdapters(
 		tool_registry: (context) => revokeTools(services, context),
 		mcp_adapter: (context) => revokeMcp(services, context),
 		provider_registry: (context) => revokeProviders(services, context),
+		quota_registry: (context) => revokeQuotas(services, context),
 	};
 }
 
@@ -316,7 +343,8 @@ async function restorePluginAccess(
 	services: Pick<
 		PluginPlatformServices,
 		"capabilityBroker" | "secretBroker" | "toolRegistry" | "mcpAdapter" | "providerRegistry"
-	>,
+	> &
+		Partial<Pick<PluginPlatformServices, "quotaRegistry">>,
 	pluginId: string,
 ): Promise<void> {
 	const failures: unknown[] = [];
@@ -326,6 +354,7 @@ async function restorePluginAccess(
 		() => services.toolRegistry.enablePlugin(pluginId),
 		() => services.mcpAdapter.markAvailable(pluginId),
 		() => services.providerRegistry.enablePlugin(pluginId),
+		() => services.quotaRegistry?.enablePlugin(pluginId),
 	];
 	for (const step of steps) {
 		try {
@@ -488,11 +517,15 @@ export function createPluginPlatformServices(
 			adapters: options.publicApiAdapters,
 		});
 	const secretVault = options.secretVault ?? pluginSecretVault;
+	const providerConnectionService =
+		options.providerConnectionService ?? pluginProviderConnectionService;
+	const quotaService = options.quotaService ?? providerQuotaService;
 	const hostServices =
 		options.hostServices ??
 		createPluginHostServices({
 			capabilityBroker,
 			permissionStore,
+			providerConnectionService,
 			publicApi,
 			eventGateway,
 			storageFactory,
@@ -851,6 +884,17 @@ export function createPluginPlatformServices(
 	// instead of reporting every credentialed channel as unconfigured.
 	void secretVault.warm().catch(() => undefined);
 	registerExtraSearchChannelSource("plugins", pluginSearchChannelSource(searchRegistry));
+	const quotaRegistry =
+		options.quotaRegistry ??
+		new PluginQuotaRegistry({
+			stateStore,
+			permissionStore,
+			hostServices,
+			capabilityBroker,
+			providerConnectionService,
+			resolveRuntime: (pluginId) => runtimeSupervisor.get(pluginId),
+		});
+	quotaService.configureDriver(quotaRegistry);
 	const contributionCoordinator =
 		options.contributionCoordinator ??
 		new PluginContributionCoordinator({
@@ -859,6 +903,7 @@ export function createPluginPlatformServices(
 			pluginCommandRegistry,
 			providerRegistry,
 			searchRegistry,
+			quotaRegistry,
 			agentToolBridge: toolBridge,
 			lifecycleStates: () => stateStore.listStates(),
 			// Synchronous read from the already-loaded state document, so a restart
@@ -894,6 +939,7 @@ export function createPluginPlatformServices(
 				toolRegistry,
 				mcpAdapter,
 				providerRegistry,
+				quotaRegistry,
 			}),
 			logger: {
 				error: (message, context) => logger.error(message, context),
@@ -920,6 +966,9 @@ export function createPluginPlatformServices(
 		mcpAdapter,
 		providerRegistry,
 		searchRegistry,
+		quotaRegistry,
+		quotaService,
+		providerConnectionService,
 		providerClientPool,
 		providerCatalogRefresher,
 		providerConfigService,

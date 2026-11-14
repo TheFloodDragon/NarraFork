@@ -2809,3 +2809,109 @@ describe("subagent live output char count", () => {
 		expect(toolOutputFrames().at(-1)?.output).toBe("7");
 	});
 });
+
+describe("Custom API stream quota generation", () => {
+	test("a captured old-account balance is neither broadcast nor persisted after rotation", async () => {
+		const { settings } = await import("../../lib/settings");
+		const { captureCustomApiQuotaPushTarget } = await import("../provider-quota-push");
+		const { getCustomApiCachedQuota, purgeCustomApiQuotaCache } = await import(
+			"../../lib/custom-api-quota-cache"
+		);
+		const provider = {
+			id: "push-rotation",
+			prefix: "push-rotation",
+			name: "Push fixture",
+			apiKey: "first-key",
+			baseUrl: "https://relay.test/v1",
+			protocol: "completions-compatible" as const,
+			defaultModel: "model",
+		};
+		settings.customApiProviders = [provider];
+		purgeCustomApiQuotaCache([provider.id]);
+		const target = captureCustomApiQuotaPushTarget(provider.prefix);
+		if (!target) throw new Error("expected captured Custom API target");
+		const ctx = {
+			...makeMainContext(),
+			providerPrefix: provider.prefix,
+			customApiQuotaTarget: target,
+		};
+		provider.apiKey = "new-key";
+		const before = broadcastMessages.length;
+		await processEvent(
+			{ type: "quota_balance", quotaBalance: "999", detailedQuotaBalance: "old account" },
+			ctx,
+		);
+		expect(broadcastMessages.length).toBe(before);
+		expect(getCustomApiCachedQuota(provider.id)).toBeUndefined();
+	});
+
+	test("current stream quota keeps zero, target identity and the existing push cache", async () => {
+		const { settings } = await import("../../lib/settings");
+		const { captureCustomApiQuotaPushTarget } = await import("../provider-quota-push");
+		const { getCustomApiCachedQuota, purgeCustomApiQuotaCache } = await import(
+			"../../lib/custom-api-quota-cache"
+		);
+		const provider = {
+			id: "push-current",
+			prefix: "push-current",
+			name: "Push fixture",
+			apiKey: "fixture-key",
+			baseUrl: "https://relay.test/v1",
+			protocol: "completions-compatible" as const,
+			defaultModel: "model",
+		};
+		settings.customApiProviders = [provider];
+		const target = captureCustomApiQuotaPushTarget(provider.prefix);
+		if (!target) throw new Error("expected captured Custom API target");
+		await processEvent(
+			{ type: "quota_balance", quotaBalance: "0", detailedQuotaBalance: "live detail" },
+			{ ...makeMainContext(), providerPrefix: provider.prefix, customApiQuotaTarget: target },
+		);
+		expect(broadcastMessages.at(-1)).toMatchObject({
+			type: "quota_balance",
+			customApiQuotaTarget: target,
+			quotaBalance: "0",
+		});
+		expect(getCustomApiCachedQuota(provider.id)).toMatchObject({
+			quotaBalance: "0",
+			detailedQuotaBalance: "live detail",
+		});
+		purgeCustomApiQuotaCache([provider.id]);
+	});
+});
+
+test("a captured Custom API quota pass never feeds the independent NUG cache", async () => {
+	const { settings } = await import("../../lib/settings");
+	const { captureCustomApiQuotaPushTarget } = await import("../provider-quota-push");
+	const { purgeCustomApiQuotaCache } = await import("../../lib/custom-api-quota-cache");
+	const nug = await import("../../routes/nug");
+	const update = spyOn(nug, "updateNugQuotaByPrefix").mockImplementation(() => {});
+	const provider = {
+		id: "push-scope",
+		prefix: "push-scope",
+		name: "Push fixture",
+		apiKey: "fixture-key",
+		baseUrl: "https://relay.test/v1",
+		protocol: "completions-compatible" as const,
+		defaultModel: "model",
+	};
+	settings.customApiProviders = [provider];
+	const target = captureCustomApiQuotaPushTarget(provider.prefix);
+	if (!target) throw new Error("expected captured Custom API target");
+	try {
+		await processEvent(
+			{ type: "quota_balance", quotaBalance: "999" },
+			{ ...makeMainContext(), providerPrefix: provider.prefix, customApiQuotaTarget: target },
+		);
+		expect(update).not.toHaveBeenCalled();
+		await processEvent(
+			{ type: "quota_balance", quotaBalance: "7" },
+			{ ...makeMainContext(), providerPrefix: "nug-fixture", customApiQuotaTarget: null },
+		);
+		expect(update).toHaveBeenCalledTimes(1);
+		expect(update.mock.calls[0]).toEqual(["nug-fixture", 7, null]);
+	} finally {
+		update.mockRestore();
+		purgeCustomApiQuotaCache([provider.id]);
+	}
+});

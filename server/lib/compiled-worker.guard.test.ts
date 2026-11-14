@@ -48,4 +48,10 @@ test("worker spawns go through the shared resolver", () => {
 		if (!routed) offenders.push(path);
 	}
 	expect(offenders).toEqual([]);
+}, 60000);
+
+test("pooled and ephemeral database workers normalize Windows embedded virtual keys", () => {
+	const text = readFileSync(join(root, "server/lib/db-worker/pool.ts"), "utf8");
+	expect([...text.matchAll(/new Worker\(workerEntryFromSpecifier\(specifier\)\)/g)].length).toBe(2);
+	expect(text).not.toContain("new Worker(specifier)");
 });

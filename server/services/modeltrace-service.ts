@@ -27,6 +27,8 @@ import { createRuntimeEventContext } from "./agent-runtime/context";
 import { type ExecutionOwner, tryClaimExecution } from "./agent-runtime/ownership";
 import { clearTraceHistory, ensureTraceNarrator } from "./modeltrace-store";
 
+import { captureCustomApiQuotaPushTarget } from "./provider-quota-push";
+
 // Session interrupt imports cancelModelTrace synchronously. Load persistence, websocket
 // and narrator-service only on execution to avoid their session dependency cycles.
 const controllers = hotSafe("modeltrace.controllers", () => new Map<string, AbortController>());
@@ -128,6 +130,7 @@ async function runProbe(
 		narratorId: id,
 		conversationId: params.conversationId,
 		provider: snapshot.provider,
+		customApiQuotaTarget: captureCustomApiQuotaPushTarget(snapshot.provider),
 		model: params.model,
 		locale,
 		getTurnStartedAt: () => new Date(startedAt).toISOString(),

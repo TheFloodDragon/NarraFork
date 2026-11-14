@@ -1,5 +1,6 @@
 {
 	"title": "Settings",
+
 	"remoteAccessSection": "WebRTC remote access",
 	"remoteAccess": {
 		"description": "Connect a paired browser directly to this instance using the matching hosted remote frontend. Pairing does not replace administrator login. No business traffic is relayed through the signaling server.",
@@ -49,6 +50,14 @@
 			"stopping": "Stopping",
 			"failed": "Unavailable",
 			"unknown": "Unknown"
+		}
+	},
+	"integrations": {
+		"capabilities": {
+			"quota": { "provide": "Provide Custom API quota snapshots" },
+			"provider": {
+				"connection": { "request": "Read quota through a host-managed provider connection" }
+			}
 		}
 	},
 	"providerBalance": {

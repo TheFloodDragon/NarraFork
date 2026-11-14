@@ -26,7 +26,7 @@
  */
 
 import { cpus } from "node:os";
-import { compiledWorkerSpecifiers } from "../compiled-worker";
+import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "../compiled-worker";
 import { hotOnce, hotSafe, hotTimerClear } from "../hot-safe";
 import { logger } from "../logger";
 import { RUNTIME_BUILD_ID } from "../runtime-target";
@@ -389,9 +389,9 @@ function awaitReady(
 
 /** Start a worker from one specific specifier. Its ready signal settles on the ready/error event. */
 function spawnWorkerFrom(specifier: string): PooledWorker {
-	// The global Worker accepts file: hrefs. node:worker_threads does not; those call sites
-	// pass workerEntryFromSpecifier instead.
-	const worker = new Worker(specifier);
+	// Windows compiled virtual files must keep forward-slash keys; file: hrefs are
+	// otherwise normalized to a filesystem path that misses Bun's embedded worker.
+	const worker = new Worker(workerEntryFromSpecifier(specifier));
 	const pooled: PooledWorker = {
 		worker,
 		specifier,
@@ -869,7 +869,7 @@ function runEphemeralOnSpecifier<T>(
 	const timeoutMs = Math.max(0, deadlineAt - Date.now());
 	const traceParent = currentSqlTraceSpan()?.id;
 	return new Promise<T>((resolve, reject) => {
-		const worker = new Worker(specifier);
+		const worker = new Worker(workerEntryFromSpecifier(specifier));
 		let settled = false;
 		let ready = false;
 		const finish = (error?: Error, result?: T) => {

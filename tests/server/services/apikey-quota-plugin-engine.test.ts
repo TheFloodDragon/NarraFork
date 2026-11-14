@@ -1,324 +1,178 @@
-import { describe, expect, test } from "bun:test";
-import { BalanceProbeRequestError } from "@server/lib/provider-balance-adapters";
-import type { CustomApiProviderConfig } from "@server/lib/settings";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import {
-	type ApikeyQuotaEngineOptions,
-	createApikeyQuotaEngine,
-	type QuotaPluginActivator,
-	type QuotaToolInvoker,
-} from "@server/services/apikey-quota-plugin-engine";
+	archivedQuotaFixture,
+	closeQuotaTestPackage,
+	legacyQuotaFixture,
+	quotaConfig,
+	required,
+	walletQuota,
+} from "../../../server/lib/__tests__/provider-quota-legacy-fixture";
+import { toProviderBalanceSnapshot } from "../../../server/lib/provider-balance-cache";
+import { ProviderQuotaError } from "../../../server/lib/provider-quota-async";
+import { quotaQueryParamsSchema } from "../../../shared/provider-quota";
 
-const config = (): CustomApiProviderConfig => ({
-	id: "relay1",
-	name: "relay1",
-	prefix: "relay1",
-	baseUrl: "https://relay.example.com/v1",
-	protocol: "completions-compatible",
-	apiKey: "sk-secret",
-	defaultModel: "m",
-	extraHeaders: { "X-Tenant": "t1" },
-	userAgentMode: "narrafork",
-	proxy: { mode: "custom", url: "http://127.0.0.1:7890" },
-	tlsRejectUnauthorized: false,
+let archive: Awaited<ReturnType<typeof archivedQuotaFixture>>;
+let fixture: ReturnType<typeof legacyQuotaFixture> | undefined;
+let balance = 12.5;
+beforeAll(async () => {
+	archive = await archivedQuotaFixture({
+		fetch: async () => Response.json({ isValid: true, mode: "unrestricted", unit: "USD", balance }),
+	});
+}, 60000);
+afterEach(() => {
+	fixture?.dispose();
+	fixture = undefined;
+	mock.restore();
 });
-
-const signal = () => AbortSignal.timeout(5_000);
-
-const okProbe = () => ({
-	status: "ok",
-	adapter: "sub2api",
-	root: "https://relay.example.com",
-	balance: { scope: "wallet", unlimited: false, amounts: [{ unit: "USD", remaining: 12.5 }] },
+afterAll(async () => {
+	await archive?.close();
+	await closeQuotaTestPackage();
 });
-
-const okRefresh = () => ({
-	status: "ok",
-	balance: { scope: "wallet", unlimited: false, amounts: [{ unit: "USD", remaining: 3 }] },
-});
-
-interface Harness {
-	invocations: Array<{ fullId: string; input: Record<string, unknown>; options?: unknown }>;
-	activations: string[];
-	fallbackCalls: string[];
-}
-
-/**
- * A fake tool registry plus a fake activator.
- *
- * The registry is the *only* way the engine may reach the plugin, so this boundary is what the
- * decision table must be proven against: the engine owns no process and no connection.
- */
-function setup(
-	respond: (input: Record<string, unknown>) => unknown,
-	options: {
-		activateThrows?: Error;
-		invokeThrows?: Error;
-		output?: unknown;
-		isError?: boolean;
-		noActivator?: boolean;
-	} = {},
-) {
-	const state: Harness = { invocations: [], activations: [], fallbackCalls: [] };
-	const tools: QuotaToolInvoker = {
-		invoke: async (fullId, input, invocationOptions) => {
-			state.invocations.push({
-				fullId,
-				input: input as Record<string, unknown>,
-				options: invocationOptions,
-			});
-			if (options.invokeThrows) throw options.invokeThrows;
-			const output = options.output ?? JSON.stringify(respond(input as Record<string, unknown>));
-			return {
-				output: typeof output === "string" ? output : JSON.stringify(output),
-				isError: options.isError,
-			};
-		},
-	};
-	const activator: QuotaPluginActivator = {
-		activate: async (pluginId) => {
-			state.activations.push(pluginId);
-			if (options.activateThrows) throw options.activateThrows;
-		},
-	};
-	const engineOptions: ApikeyQuotaEngineOptions = {
-		tools,
-		...(options.noActivator ? {} : { activator }),
-		fallback: {
-			id: "fallback",
-			probe: async () => {
-				state.fallbackCalls.push("probe");
-				return {
-					adapter: "new-api" as const,
-					root: "https://relay.example.com",
-					balance: { scope: "key" as const, unlimited: true, amounts: [] },
-				};
-			},
-			refresh: async () => {
-				state.fallbackCalls.push("refresh");
-				return { scope: "key" as const, unlimited: true, amounts: [] };
-			},
-		},
-		onDiagnostic: () => {},
-	};
-	return { state, engine: createApikeyQuotaEngine(engineOptions) };
-}
-
-describe("apikey-quota builtin engine", () => {
-	test("a probe activates the plugin and goes through the shared tool registry", async () => {
-		const { state, engine } = setup(okProbe);
-
-		const found = await engine.probe({ config: config(), signal: signal() });
-
-		expect(found).toEqual({
-			adapter: "sub2api",
-			root: "https://relay.example.com",
-			balance: { scope: "wallet", unlimited: false, amounts: [{ unit: "USD", remaining: 12.5 }] },
-		});
-		// Activation is what registers the tool, and it carries the same activation event the
-		// manifest declares for tools so the plugin treats it as a normal tool activation.
-		expect(state.activations).toEqual(["com.narrafork.apikey-quota"]);
-		expect(state.invocations).toHaveLength(1);
-		expect(state.invocations[0]?.fullId).toBe("com.narrafork.apikey-quota/query-balance");
-		// Background principal is what makes this a host-internal call rather than a narrator one.
-		expect(state.invocations[0]?.options).toMatchObject({
-			invocation: { kind: "plugin_background", source: "internal" },
-		});
-		// The bundled adapters must not run when the plugin answered.
-		expect(state.fallbackCalls).toEqual([]);
+const config = () =>
+	quotaConfig({
+		id: `engine-${crypto.randomUUID()}`,
+		extraHeaders: { "X-Tenant": "t1" },
+		userAgentMode: "custom",
+		customUserAgent: "engine-agent",
+		proxy: { mode: "direct" },
+		tlsRejectUnauthorized: false,
 	});
 
-	test("the connection facts the plugin needs are forwarded", async () => {
-		const { state, engine } = setup(okProbe);
-
-		await engine.probe({ config: config(), signal: signal(), requestTimeoutMs: 4_000 });
-
-		expect(state.invocations[0]?.input).toMatchObject({
+/** Old engine failures now fail closed through the source service, never a native fallback. */
+describe("apikey engine migration to actual quota contribution", () => {
+	test("a probe executes the archived quota.query process and not tools.invoke", async () => {
+		const runtime = required(archive.supervisor.get(archive.pluginId));
+		const rpc = spyOn(runtime, "request");
+		const result = await archive.rpc(config());
+		expect(result).toMatchObject({
+			status: "supported",
+			data: { format: "sub2api", amounts: [{ remaining: 12.5 }] },
+		});
+		expect(rpc.mock.calls.some(([method]) => method === "quota.query")).toBe(true);
+		expect(rpc.mock.calls.some(([method]) => method === "tools.invoke")).toBe(false);
+		expect(runtime.pid).toBeGreaterThan(0);
+	});
+	test("connection facts stay host-private; only target identity/reference cross RPC", async () => {
+		const runtime = required(archive.supervisor.get(archive.pluginId));
+		const rpc = spyOn(runtime, "request");
+		const cfg = config();
+		await archive.rpc(cfg);
+		const input = rpc.mock.calls.find(([method]) => method === "quota.query")?.[1];
+		expect(quotaQueryParamsSchema.safeParse(input).success).toBe(true);
+		expect(input).toMatchObject({
 			mode: "probe",
-			baseUrl: "https://relay.example.com/v1",
-			apiKey: "sk-secret",
-			headers: { "X-Tenant": "t1" },
-			proxy: "http://127.0.0.1:7890",
-			tlsRejectUnauthorized: false,
-			timeoutMs: 4_000,
+			target: { providerId: cfg.id, baseUrl: cfg.baseUrl },
+		});
+		expect(JSON.stringify(input)).not.toMatch(
+			/test-secret-key|apiKey|X-Tenant|tlsRejectUnauthorized|proxy/,
+		);
+	});
+	test("unsupported is authoritative and never invokes another native engine", async () => {
+		fixture = legacyQuotaFixture();
+		fixture.query.mockResolvedValue({ status: "unsupported", data: null, error: null });
+		expect(await fixture.service.refresh("relay-test")).toMatchObject({
+			status: "unsupported",
+			data: null,
+		});
+		expect(fixture.query).toHaveBeenCalledTimes(1);
+	});
+	for (const code of ["request_failed", "invalid_response", "invalid_configuration"] as const) {
+		test(`typed ${code} failures have safe fixed codes, no inline fallback`, async () => {
+			fixture = legacyQuotaFixture();
+			fixture.query.mockRejectedValue(new ProviderQuotaError(code));
+			expect(await fixture.service.refresh("relay-test")).toMatchObject({
+				status: "error",
+				error: code,
+				data: null,
+			});
+			expect(fixture.query).toHaveBeenCalledTimes(1);
+		});
+	}
+	for (const output of [
+		{ status: "ok", balance: walletQuota },
+		{ status: "nonsense" },
+		"boom",
+		{ status: "supported", error: null, data: null },
+	]) {
+		test(`invalid former tool/partial output ${JSON.stringify(output)} is deterministic invalid_response`, async () => {
+			fixture = legacyQuotaFixture();
+			fixture.query.mockResolvedValue(output as never);
+			expect(await fixture.service.refresh("relay-test")).toMatchObject({
+				status: "error",
+				error: "invalid_response",
+				data: null,
+			});
+			expect(fixture.query).toHaveBeenCalledTimes(1);
+		});
+	}
+	test("a disabled source fails before invoking it; no native adapter answers instead", async () => {
+		fixture = legacyQuotaFixture();
+		fixture.revoke();
+		expect(await fixture.service.refresh("relay-test")).toMatchObject({
+			status: "unavailable",
+			data: null,
+		});
+		expect(fixture.query).not.toHaveBeenCalled();
+	});
+	test("source disabled between scheduling and reply discards its result", async () => {
+		fixture = legacyQuotaFixture();
+		let finish!: (value: never) => void;
+		fixture.query.mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					finish = resolve;
+				}),
+		);
+		const pending = fixture.service.refresh("relay-test");
+		fixture.revoke();
+		finish({ status: "supported", data: walletQuota, error: null } as never);
+		expect(await pending).toBeNull();
+		expect(fixture.service.peek("relay-test")?.data).toBeNull();
+	});
+	test("refresh reports unavailable in the same way as probe", async () => {
+		fixture = legacyQuotaFixture();
+		fixture.revoke();
+		expect(await fixture.service.refresh("relay-test", { mode: "refresh" })).toMatchObject({
+			status: "unavailable",
+			data: null,
 		});
 	});
-
-	test("unsupported is authoritative and does not probe the bundled path", async () => {
-		const { state, engine } = setup(() => ({ status: "unsupported" }));
-
-		await expect(engine.probe({ config: config(), signal: signal() })).resolves.toBeNull();
-		expect(state.fallbackCalls).toEqual([]);
-	});
-
-	test("failed becomes the existing typed probe error", async () => {
-		const { state, engine } = setup(() => ({ status: "failed", kind: "unsupported" }));
-
-		const error = await engine
-			.probe({ config: config(), signal: signal() })
-			.catch((thrown) => thrown);
-		expect(error).toBeInstanceOf(BalanceProbeRequestError);
-		expect(error.kind).toBe("unsupported");
-		expect(state.fallbackCalls).toEqual([]);
-	});
-
-	test("a probe answer without adapter/root falls back", async () => {
-		const { state, engine } = setup(() => ({ status: "ok", balance: okProbe().balance }));
-
-		await engine.probe({ config: config(), signal: signal() });
-
-		expect(state.fallbackCalls).toEqual(["probe"]);
-	});
-
-	test("an unregistered tool falls back to the bundled adapters", async () => {
-		const { state, engine } = setup(okProbe, {
-			invokeThrows: Object.assign(new Error("Unknown plugin tool"), { code: "NOT_FOUND" }),
+	test("activation/source errors do not silently reinstate builtin fetching", async () => {
+		fixture = legacyQuotaFixture();
+		fixture.query.mockRejectedValue(new ProviderQuotaError("unavailable"));
+		expect(await fixture.service.refresh("relay-test")).toMatchObject({
+			status: "unavailable",
+			data: null,
 		});
-
-		await engine.probe({ config: config(), signal: signal() });
-
-		expect(state.fallbackCalls).toEqual(["probe"]);
+		expect(fixture.query).toHaveBeenCalledTimes(1);
 	});
-
-	test("a disabled plugin is a deterministic failure, not a fallback", async () => {
-		const { state, engine } = setup(okProbe, {
-			activateThrows: Object.assign(new Error("Plugin must be enabled"), {
-				code: "PLUGIN_NOT_ENABLED",
-			}),
+	test("refresh returns the archived plugin balance through its bounded cursor", async () => {
+		balance = 3;
+		const cfg = config();
+		const found = await archive.rpc(cfg);
+		const refreshed = await archive.rpc(cfg, "refresh", found.cursor);
+		expect(refreshed).toMatchObject({ status: "supported", data: { amounts: [{ remaining: 3 }] } });
+		balance = 12.5;
+	});
+	test("refresh failures preserve the normalized error contract, not raw upstream strings", async () => {
+		fixture = legacyQuotaFixture();
+		fixture.query.mockRejectedValue(new ProviderQuotaError("request_failed"));
+		const result = await fixture.service.refresh("relay-test", { mode: "refresh" });
+		expect(result).toMatchObject({ status: "error", error: "request_failed" });
+		expect(result && toProviderBalanceSnapshot(result).error).toBe("request_failed");
+	});
+	test("injecting test HTTP still executes the real archived RPC instead of an in-process fallback", async () => {
+		const rpc = spyOn(required(archive.supervisor.get(archive.pluginId)), "request");
+		await archive.rpc(config());
+		expect(rpc.mock.calls.some(([method]) => method === "quota.query")).toBe(true);
+	});
+	test("no installed source/activator remains unavailable rather than native success", async () => {
+		fixture = legacyQuotaFixture();
+		fixture.service.configureDriver({ listSources: () => [], query: fixture.query });
+		expect(await fixture.service.refresh("relay-test")).toMatchObject({
+			status: "unavailable",
+			data: null,
 		});
-
-		const error = await engine
-			.probe({ config: config(), signal: signal() })
-			.catch((thrown) => thrown);
-
-		expect(error).toBeInstanceOf(BalanceProbeRequestError);
-		expect(error.kind).toBe("plugin_disabled");
-		// The plugin owns the capability: answering from the bundled adapters would keep
-		// serving quota queries the administrator switched off.
-		expect(state.fallbackCalls).toEqual([]);
-		expect(state.invocations).toEqual([]);
-	});
-
-	test("a plugin disabled between activation and the call is recognised too", async () => {
-		const { state, engine } = setup(okProbe, {
-			invokeThrows: Object.assign(new Error("Plugin disabled"), { code: "PLUGIN_DISABLED" }),
-		});
-
-		const error = await engine
-			.probe({ config: config(), signal: signal() })
-			.catch((thrown) => thrown);
-
-		expect(error.kind).toBe("plugin_disabled");
-		expect(state.invocations).toHaveLength(1);
-		expect(state.fallbackCalls).toEqual([]);
-	});
-
-	test("refresh reports a disabled plugin the same way", async () => {
-		const { state, engine } = setup(okRefresh, {
-			activateThrows: Object.assign(new Error("Plugin must be enabled"), {
-				code: "PLUGIN_NOT_ENABLED",
-			}),
-		});
-
-		const error = await engine
-			.refresh({
-				config: config(),
-				signal: signal(),
-				adapter: "sub2api",
-				root: "https://relay.example.com",
-			})
-			.catch((thrown) => thrown);
-
-		expect(error.kind).toBe("plugin_disabled");
-		expect(state.fallbackCalls).toEqual([]);
-	});
-
-	test("an enabled plugin that fails for another reason still falls back", async () => {
-		const { state, engine } = setup(okProbe, { activateThrows: new Error("activation failed") });
-
-		await engine.probe({ config: config(), signal: signal() });
-
-		expect(state.invocations).toEqual([]);
-		expect(state.fallbackCalls).toEqual(["probe"]);
-	});
-
-	test("output that does not match the contract falls back", async () => {
-		const { state, engine } = setup(okProbe, { output: { status: "nonsense" } });
-
-		await engine.probe({ config: config(), signal: signal() });
-
-		expect(state.fallbackCalls).toEqual(["probe"]);
-	});
-
-	test("an error result from the tool falls back", async () => {
-		const { state, engine } = setup(okProbe, { output: "boom", isError: true });
-
-		await engine.probe({ config: config(), signal: signal() });
-
-		expect(state.fallbackCalls).toEqual(["probe"]);
-	});
-
-	test("refresh returns the plugin balance", async () => {
-		const { state, engine } = setup(okRefresh);
-
-		const balance = await engine.refresh({
-			config: config(),
-			signal: signal(),
-			adapter: "sub2api",
-			root: "https://relay.example.com",
-		});
-
-		expect(balance).toMatchObject({ scope: "wallet" });
-		expect(state.invocations[0]?.input).toMatchObject({
-			mode: "refresh",
-			adapter: "sub2api",
-			root: "https://relay.example.com",
-		});
-		expect(state.fallbackCalls).toEqual([]);
-	});
-
-	test("refresh reports unsupported and failed the same way as probe", async () => {
-		const unsupported = setup(() => ({ status: "unsupported" }));
-		await expect(
-			unsupported.engine.refresh({
-				config: config(),
-				signal: signal(),
-				adapter: "sub2api",
-				root: "https://relay.example.com",
-			}),
-		).rejects.toBeInstanceOf(BalanceProbeRequestError);
-
-		const failed = setup(() => ({ status: "failed", kind: "transient" }));
-		const error = await failed.engine
-			.refresh({
-				config: config(),
-				signal: signal(),
-				adapter: "sub2api",
-				root: "https://relay.example.com",
-			})
-			.catch((thrown) => thrown);
-		expect(error.kind).toBe("transient");
-	});
-
-	test("an injected fetch runs in-process instead of crossing the boundary", async () => {
-		const { state, engine } = setup(okProbe);
-
-		await engine.probe({
-			config: config(),
-			signal: signal(),
-			fetch: (async () => new Response("{}")) as unknown as typeof fetch,
-		});
-
-		// The seam cannot be serialized into a child process, so it never reaches the registry.
-		expect(state.invocations).toEqual([]);
-		expect(state.fallbackCalls).toEqual(["probe"]);
-	});
-
-	test("without an activator the engine still falls back safely", async () => {
-		const { state, engine } = setup(okProbe, { noActivator: true });
-
-		await engine.probe({ config: config(), signal: signal() });
-
-		expect(state.invocations).toHaveLength(1);
-		expect(state.activations).toEqual([]);
+		expect(fixture.query).not.toHaveBeenCalled();
 	});
 });

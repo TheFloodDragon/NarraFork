@@ -67,7 +67,7 @@ export interface QuotaPanelView {
 	/** Worst level across windows. */
 	level: QuotaLevel;
 	/** Extra label/value rows under the windows (balance, monthly credits …). */
-	rows: Array<{ label: string; value: string }>;
+	rows: Array<{ id?: string; label: string; value: string }>;
 	/** The last refresh failed; any numbers shown are from an earlier fetch. */
 	failed: boolean;
 	/** Why it failed, when the viewer may see it (admins only). */

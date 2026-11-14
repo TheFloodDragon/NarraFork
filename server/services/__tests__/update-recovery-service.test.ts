@@ -587,7 +587,8 @@ async function prepareRecovery(
 		const run = runtimePublication.startRun({
 			narratorId: subagentId,
 			binding: { deliverTo: { narratorId: record.narratorId, toolUseId: "test-tool-use" } },
-		}).publication!;
+		}).publication;
+		if (!run) throw new Error("Expected a published subagent run");
 		record.payloadJson = { ...record.payloadJson, logicalRunId: run.logicalRunId };
 	}
 	updateCoordinator.writePlannedUpdateRecoverySnapshot({
@@ -1745,6 +1746,7 @@ describe("planned update continuation scheduling", () => {
 					statusEntered.resolve();
 					await statusGate.promise;
 				}
+				return undefined;
 			},
 		);
 		const runtimeSpy = spyOn(runtime, "runAgentLoopUnlocked").mockResolvedValue({ started: true });

@@ -20,6 +20,7 @@
 import { logger } from "../logger";
 import { keyQuotaBlockedUntil } from "../provider-key-quota";
 import { getProviderKeyStore, type ProviderKey } from "../provider-keys";
+import { bindFrozenQuotaTarget, type FrozenCustomApiQuotaTarget } from "../provider-quota-async";
 import { SessionAffinity } from "./session-affinity";
 
 export { withProviderKey } from "../provider-keys";
@@ -277,6 +278,15 @@ export class PooledProvider implements ProviderAdapter {
 			const key = selectProviderKey(this.providerId, session, tried);
 			if (!key) throw new Error("This provider has no usable API key");
 			tried.add(key.id);
+			let capturedQuota: FrozenCustomApiQuotaTarget | null = null;
+			if (params.captureCustomApiQuotaTarget) {
+				try {
+					const target = params.captureCustomApiQuotaTarget(this.providerId, key.id);
+					capturedQuota = target ? Object.freeze({ ...target }) : null;
+				} catch {
+					/* Display provenance failure must not change inference behavior. */
+				}
+			}
 			let streamed = false;
 			try {
 				for await (const event of this.adapterFor(key).chat({
@@ -285,7 +295,9 @@ export class PooledProvider implements ProviderAdapter {
 						params.onRequestStart?.({ credentialId: info?.credentialId ?? key.id }),
 				})) {
 					streamed ||= shouldTreatCodexStreamEventAsYielded(event);
-					yield { ...event, credentialId: event.credentialId ?? key.id };
+					const decorated = { ...event, credentialId: event.credentialId ?? key.id };
+					if (params.captureCustomApiQuotaTarget) bindFrozenQuotaTarget(decorated, capturedQuota);
+					yield decorated;
 				}
 				clearKeyCooldown(key.id);
 				return;

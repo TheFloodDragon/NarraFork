@@ -77,6 +77,25 @@ function notification(method: string, params?: unknown): JsonRpcNotification {
 }
 
 describe("PluginRpcConnection", () => {
+	it("bounds quota replies per pending request without enlarging the connection inbound budget", async () => {
+		const transport = new MemoryTransport();
+		const connection = new PluginRpcConnection({ transport });
+		const frameLimit = connection.getLimits().maxInboundFrameBytes;
+		transport.onSend = (message) => {
+			if (!("id" in message) || !("method" in message)) return;
+			transport.emit(responseFor(message.id, "x".repeat(20 * 1024)));
+		};
+		await expect(
+			connection.request("quota.query", {}, { maxResponseBytes: 16 * 1024 + 1024 }),
+		).rejects.toMatchObject({ code: "RESPONSE_FRAME_LIMIT" });
+		expect(connection.getLimits().maxInboundFrameBytes).toBe(frameLimit);
+		const ordinary = await connection.request("ordinary.query", {});
+		expect(
+			"result" in ordinary && typeof ordinary.result === "string" && ordinary.result.length,
+		).toBe(20 * 1024);
+		expect(connection.outboundPendingCount).toBe(0);
+		connection.close();
+	});
 	it("serializes outbound bodies once and accounts for UTF-8 framing and control reserve", async () => {
 		const transport = new MemoryTransport();
 		const message = notification("bytes", { text: "中文" });

@@ -1,5 +1,6 @@
 import { chmod, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
+import { isMainThread, parentPort } from "node:worker_threads";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import { ValidationError } from "@server/lib/errors";
 import { generateShortId } from "@server/lib/id";
@@ -16,6 +17,10 @@ import {
 } from "@server/lib/plugins/permissions";
 import type { JsonValue } from "@server/lib/plugins/protocol";
 import type { ProxyOverride } from "@server/lib/settings/types";
+import { type PluginSourceBinding, pluginSourceBindingSchema } from "@shared/plugin-source";
+import type { InstalledPackageResult, PackageStoreLimits } from "./plugin-package-store";
+import type { SbomInstallPolicy } from "./plugin-sbom";
+import type { PluginSignature, TrustedPluginKey } from "./plugin-signature";
 
 const STATE_FILE_VERSION = 1;
 const JOURNAL_FILE_VERSION = 1;
@@ -28,6 +33,7 @@ const DEFAULT_MAX_STRING_BYTES = 16 * 1024;
 const DEFAULT_MAX_OPERATIONS = 1_000;
 const DEFAULT_MAX_DIAGNOSTICS = 50;
 const DEFAULT_MAX_ERROR_BYTES = 4 * 1024;
+const MAX_BUNDLED_BOOTSTRAPS = 64;
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const VERSION_PATTERN =
 	/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -137,6 +143,8 @@ export interface PluginStateRecord {
 	providerPrefixes: PluginProviderPrefixMap;
 	/** Proxy overrides by contribution id; absent entries follow the global proxy policy. */
 	providerProxies: PluginProviderProxyMap;
+	/** Optional for old state files; package hints never replace an approved binding on upgrade. */
+	sourceBinding?: PluginSourceBinding;
 	crashCount: number;
 	restartCount: number;
 	consecutiveFailures: number;
@@ -161,6 +169,9 @@ export interface PluginJournalContext {
 	phase?: string;
 	reason?: string;
 	recoveredAt?: string;
+	/** Source upgrades persist a bounded, validated old-state checkpoint for compensation. */
+	sourceUpdate?: boolean;
+	rollbackState?: PluginStateRecord;
 }
 
 export interface PluginJournalEntry {
@@ -211,9 +222,22 @@ export interface BeginPluginOperationInput {
 	context?: PluginJournalContext;
 }
 
+export type BundledPluginDefaultChoice = "enabled" | "disabled" | "removed" | "revoked";
+
+export interface BundledPluginBootstrap {
+	status: "initializing" | "seeded" | "adopted" | "removed";
+	version: string;
+	archiveSha256: string | null;
+	/** Preserve the operator's choice before a retired builtin loses its package. */
+	defaultChoice?: BundledPluginDefaultChoice;
+	/** A replacement ID inherits refusals only, never the retired plugin's grants. */
+	inheritedFrom?: string;
+	updatedAt: string;
+}
 interface StateFileDocument {
 	version: number;
 	plugins: Record<string, PluginStateRecord>;
+	bundledBootstrap: Record<string, BundledPluginBootstrap>;
 	diagnostics: PluginPersistenceDiagnostic[];
 	updatedAt: string;
 }
@@ -386,6 +410,33 @@ function parseError(value: unknown, limits: PluginStateStoreLimits): PluginState
 	};
 }
 
+function parseSourceBinding(value: unknown): PluginSourceBinding {
+	const parsed = pluginSourceBindingSchema.safeParse(value);
+	if (
+		parsed.success &&
+		Number.isSafeInteger(parsed.data.revision) &&
+		(parsed.data.mode !== "none" || parsed.data.source === null)
+	)
+		return parsed.data;
+	// A damaged optional source disables only updates, not the healthy plugin or its grants.
+	logger.warn("Invalid optional plugin source binding; source updates disabled");
+	return {
+		revision:
+			isRecord(value) &&
+			isNonNegativeInteger(value.revision) &&
+			Number.isSafeInteger(value.revision)
+				? (value.revision as number)
+				: 0,
+		mode: "none",
+		source: null,
+		autoUpdate: false,
+	};
+}
+
+export function validatePluginStateRecord(value: unknown, pluginId: string): PluginStateRecord {
+	return parseStateRecord(pluginId, value, createLimits());
+}
+
 function parseStateRecord(
 	key: string,
 	value: unknown,
@@ -456,6 +507,9 @@ function parseStateRecord(
 		providerConfigs: parseProviderConfigs(value.providerConfigs, pluginId, limits),
 		providerPrefixes: parseProviderPrefixes(value.providerPrefixes, pluginId),
 		providerProxies: parseProviderProxies(value.providerProxies, pluginId),
+		...(value.sourceBinding === undefined
+			? {}
+			: { sourceBinding: parseSourceBinding(value.sourceBinding) }),
 		crashCount,
 		restartCount,
 		consecutiveFailures,
@@ -633,6 +687,26 @@ function parseJournalContext(value: unknown): PluginJournalContext {
 	if (context.recoveredAt !== undefined && !isIsoDate(context.recoveredAt)) {
 		throw new ValidationError("Plugin journal recoveredAt is invalid");
 	}
+	if (value.sourceUpdate !== undefined) {
+		if (typeof value.sourceUpdate !== "boolean")
+			throw new ValidationError("Plugin journal sourceUpdate is invalid");
+		context.sourceUpdate = value.sourceUpdate;
+	}
+	if (value.rollbackState !== undefined) {
+		if (
+			!isRecord(value.rollbackState) ||
+			typeof value.rollbackState.pluginId !== "string" ||
+			Buffer.byteLength(JSON.stringify(value.rollbackState)) > 64 * 1024
+		) {
+			throw new ValidationError(
+				"Plugin update recovery state is invalid or exceeds its byte budget",
+			);
+		}
+		context.rollbackState = validatePluginStateRecord(
+			value.rollbackState,
+			value.rollbackState.pluginId,
+		);
+	}
 	return context;
 }
 
@@ -684,6 +758,52 @@ function parseJournalEntry(value: unknown, limits: PluginStateStoreLimits): Plug
 	};
 }
 
+function parseBundledBootstrapRecord(value: unknown): BundledPluginBootstrap {
+	if (
+		!isRecord(value) ||
+		!["initializing", "seeded", "adopted", "removed"].includes(String(value.status)) ||
+		typeof value.version !== "string" ||
+		!VERSION_PATTERN.test(value.version) ||
+		(value.archiveSha256 !== null &&
+			(typeof value.archiveSha256 !== "string" || !HASH_PATTERN.test(value.archiveSha256))) ||
+		(value.defaultChoice !== undefined &&
+			!["enabled", "disabled", "removed", "revoked"].includes(String(value.defaultChoice))) ||
+		(value.inheritedFrom !== undefined &&
+			(typeof value.inheritedFrom !== "string" ||
+				!pluginIdSchema.safeParse(value.inheritedFrom).success ||
+				value.status !== "removed" ||
+				value.defaultChoice === undefined ||
+				value.defaultChoice === "enabled")) ||
+		!isIsoDate(value.updatedAt)
+	) {
+		throw new ValidationError("Bundled plugin bootstrap record is invalid");
+	}
+	return {
+		status: value.status as BundledPluginBootstrap["status"],
+		version: value.version,
+		archiveSha256: value.archiveSha256 as string | null,
+		...(value.defaultChoice === undefined
+			? {}
+			: { defaultChoice: value.defaultChoice as BundledPluginDefaultChoice }),
+		...(value.inheritedFrom === undefined ? {} : { inheritedFrom: value.inheritedFrom as string }),
+		updatedAt: value.updatedAt,
+	};
+}
+
+function parseBundledBootstraps(value: unknown): Record<string, BundledPluginBootstrap> {
+	if (value === undefined) return {};
+	if (!isRecord(value) || Object.keys(value).length > MAX_BUNDLED_BOOTSTRAPS) {
+		throw new ValidationError("Bundled plugin bootstrap map is invalid");
+	}
+	const entries: Record<string, BundledPluginBootstrap> = {};
+	for (const [pluginId, record] of Object.entries(value)) {
+		if (!pluginIdSchema.safeParse(pluginId).success) {
+			throw new ValidationError("Bundled plugin bootstrap identity is invalid");
+		}
+		entries[pluginId] = parseBundledBootstrapRecord(record);
+	}
+	return entries;
+}
 function parseStateDocument(value: unknown, limits: PluginStateStoreLimits): StateFileDocument {
 	assertJsonLimits(value, limits);
 	if (!isRecord(value) || value.version !== STATE_FILE_VERSION || !isRecord(value.plugins)) {
@@ -700,6 +820,7 @@ function parseStateDocument(value: unknown, limits: PluginStateStoreLimits): Sta
 	return {
 		version: STATE_FILE_VERSION,
 		plugins,
+		bundledBootstrap: parseBundledBootstraps(value.bundledBootstrap),
 		diagnostics: value.diagnostics.map(parseDiagnostic),
 		updatedAt: value.updatedAt,
 	};
@@ -824,6 +945,35 @@ export class PluginStateStore {
 		return this.getState(pluginId);
 	}
 
+	/** This ledger outlives installed state, so missing packages never imply first installation. */
+	async getBundledBootstrap(pluginId: string): Promise<BundledPluginBootstrap | undefined> {
+		await this.ensureLoaded();
+		const record = this.stateDocument?.bundledBootstrap[pluginId];
+		return record ? clone(record) : undefined;
+	}
+
+	async setBundledBootstrap(
+		pluginId: string,
+		record: Omit<BundledPluginBootstrap, "updatedAt">,
+	): Promise<BundledPluginBootstrap> {
+		pluginIdSchema.parse(pluginId);
+		return this.mutex.acquire("store", async () => {
+			await this.ensureLoadedLocked();
+			const candidate = clone(this.requireStateDocument());
+			if (
+				!candidate.bundledBootstrap[pluginId] &&
+				Object.keys(candidate.bundledBootstrap).length >= MAX_BUNDLED_BOOTSTRAPS
+			) {
+				throw new ValidationError("Bundled plugin bootstrap count exceeds the limit");
+			}
+			const parsed = parseBundledBootstrapRecord({ ...record, updatedAt: this.timestamp() });
+			candidate.bundledBootstrap[pluginId] = parsed;
+			candidate.updatedAt = parsed.updatedAt;
+			await this.writeStateLocked(candidate);
+			this.stateDocument = candidate;
+			return clone(parsed);
+		});
+	}
 	async getState(pluginId: string): Promise<PluginStateRecord | undefined> {
 		await this.ensureLoaded();
 		const state = this.stateDocument?.plugins[pluginId];
@@ -1247,6 +1397,7 @@ export class PluginStateStore {
 		return {
 			version: STATE_FILE_VERSION,
 			plugins: {},
+			bundledBootstrap: {},
 			diagnostics,
 			updatedAt: this.timestamp(),
 		};
@@ -1419,3 +1570,162 @@ export class PluginStateStore {
 }
 
 export const pluginStateStore = new PluginStateStore();
+
+/** This existing, DB-free module is also the compiled entry for source package staging. */
+if (!isMainThread && parentPort) {
+	let staged: InstalledPackageResult | undefined;
+	let signature: PluginSignature | undefined;
+	let signatureIdentity: string | null = null;
+	let previousSignatureIdentity: string | null = null;
+	const readArtifact = async (root: string, name: string): Promise<unknown | undefined> => {
+		const path = join(root, name);
+		let info: Awaited<ReturnType<typeof lstat>>;
+		try {
+			info = await lstat(path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}
+		const limit = 1024 * 1024;
+		if (!info.isFile() || info.isSymbolicLink() || info.size > limit)
+			throw new Error("Trust artifact is not a bounded regular file");
+		const handle = await open(path, "r");
+		try {
+			const bytes = new Uint8Array(limit + 1);
+			let count = 0;
+			while (count < bytes.length) {
+				const result = await handle.read(bytes, count, bytes.length - count, count);
+				if (!result.bytesRead) break;
+				count += result.bytesRead;
+			}
+			if (count > limit) throw new Error("Trust artifact exceeded its byte budget");
+			return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, count)));
+		} finally {
+			await handle.close();
+		}
+	};
+	parentPort.on(
+		"message",
+		async (message: {
+			action?: string;
+			id?: number;
+			root?: string;
+			source?: string | ArrayBuffer;
+			limits?: Partial<PackageStoreLimits>;
+			oldPackagePath?: string;
+			expectedArchiveSha256?: string;
+			policy?: {
+				enabled: boolean;
+				requireSignature: boolean;
+				key?: TrustedPluginKey;
+				sbomPolicy?: SbomInstallPolicy;
+			};
+		}) => {
+			if (message.action === "ping") {
+				parentPort?.postMessage({ packageStageReady: true });
+				return;
+			}
+			if (message.action !== "plugin_package_stage" && message.action !== "plugin_package_verify")
+				return;
+			try {
+				const { parsePluginSignature, PluginTrustKeyring, verifyPluginPackageSignature } =
+					await import("./plugin-signature");
+				if (message.action === "plugin_package_stage") {
+					if (
+						staged ||
+						typeof message.root !== "string" ||
+						(typeof message.source !== "string" && !(message.source instanceof ArrayBuffer))
+					)
+						throw new Error("Invalid package stage request");
+					if (message.expectedArchiveSha256 !== undefined) {
+						const { createHash } = await import("node:crypto");
+						if (
+							!(message.source instanceof ArrayBuffer) ||
+							createHash("sha256").update(new Uint8Array(message.source)).digest("hex") !==
+								message.expectedArchiveSha256
+						) {
+							throw Object.assign(new Error("Builtin archive failed integrity validation"), {
+								code: "PLUGIN_BUNDLED_INTEGRITY_FAILED",
+							});
+						}
+					}
+					const { PluginPackageStore } = await import("./plugin-package-store");
+					staged = await new PluginPackageStore({
+						root: message.root,
+						limits: message.limits,
+					}).install(
+						typeof message.source === "string" ? message.source : new Uint8Array(message.source),
+						{ updateCurrent: false },
+					);
+					const raw = await readArtifact(staged.path, "signature.json");
+					if (raw !== undefined) {
+						signature = parsePluginSignature(raw);
+						signatureIdentity = `${signature.algorithm}:${signature.keyId}:${signature.publisherId ?? ""}`;
+					}
+					if (message.oldPackagePath) {
+						const old = await readArtifact(message.oldPackagePath, "signature.json");
+						if (old !== undefined) {
+							const parsed = parsePluginSignature(old);
+							previousSignatureIdentity = `${parsed.algorithm}:${parsed.keyId}:${parsed.publisherId ?? ""}`;
+						}
+					}
+					const result = {
+						...staged,
+						signatureIdentity,
+						previousSignatureIdentity,
+						signatureKeyId: signature?.keyId,
+					};
+					if (Buffer.byteLength(JSON.stringify(result)) > 2 * 1024 * 1024)
+						throw new Error("Package stage response exceeds its byte budget");
+					parentPort?.postMessage({ id: message.id, result });
+					return;
+				}
+				if (!staged || !message.policy)
+					throw new Error("Package trust validation requires staged bytes and a host policy");
+				if (message.policy.enabled) {
+					if (!signature && message.policy.requireSignature)
+						throw new ValidationError("Plugin signature is required by the host trust policy");
+					if (signature) {
+						if (signature.pluginId !== staged.pluginId || signature.version !== staged.version)
+							throw new ValidationError("Plugin signature identity does not match the manifest");
+						if (!message.policy.key)
+							throw new ValidationError(
+								"Plugin signature verification requires a configured trust key",
+							);
+						const verified = await verifyPluginPackageSignature(
+							staged.path,
+							signature,
+							new PluginTrustKeyring([message.policy.key]),
+						);
+						if (!verified.valid || !verified.trusted)
+							throw new ValidationError("Plugin signature verification failed");
+					}
+					const { parseSbom, checkSbomInstallPolicy } = await import("./plugin-sbom");
+					const sbom =
+						(await readArtifact(staged.path, "sbom.spdx.json")) ??
+						(await readArtifact(staged.path, "sbom.cdx.json"));
+					if (sbom === undefined && message.policy.sbomPolicy?.requireSbom)
+						throw new ValidationError("Plugin SBOM is required by the host trust policy");
+					if (sbom !== undefined) {
+						const parsed = parseSbom(sbom);
+						if (
+							message.policy.sbomPolicy &&
+							!checkSbomInstallPolicy(parsed, message.policy.sbomPolicy).allowed
+						)
+							throw new ValidationError("Plugin SBOM policy failed");
+					}
+				}
+				parentPort?.postMessage({ id: message.id, result: { verified: true } });
+			} catch (error) {
+				parentPort?.postMessage({
+					id: message.id,
+					error: (error instanceof Error ? error.message : String(error)).slice(0, 1024),
+					code:
+						typeof (error as { code?: unknown })?.code === "string"
+							? (error as { code: string }).code
+							: "PACKAGE_STAGE_FAILED",
+				});
+			}
+		},
+	);
+}

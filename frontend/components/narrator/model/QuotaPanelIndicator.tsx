@@ -132,11 +132,13 @@ function QuotaDetails({
 				<WindowRow key={window.id} window={window} now={now} locale={i18n.language} />
 			))}
 			{view.rows.map((row) => (
-				<Group key={row.label} justify="space-between" gap="xs" wrap="nowrap">
+				<Group key={row.id ?? row.label} justify="space-between" gap="xs" wrap="nowrap">
 					<Text size="xs" fw={500}>
 						{row.label}
 					</Text>
-					<Text size="xs">{row.value}</Text>
+					<Text size="xs" style={{ whiteSpace: "pre-line", overflowWrap: "anywhere" }}>
+						{row.value}
+					</Text>
 				</Group>
 			))}
 			{view.failureDetail && (
@@ -267,7 +269,11 @@ export function QuotaPanelIndicator({
 							radius="sm"
 							variant={level === "ok" || level === "unknown" ? "light" : "filled"}
 							color={color}
-							style={{ cursor: "pointer", textTransform: "none" }}
+							style={{
+								cursor: "pointer",
+								textTransform: "none",
+								opacity: view.failed ? 0.55 : undefined,
+							}}
 						>
 							{text}
 						</Badge>

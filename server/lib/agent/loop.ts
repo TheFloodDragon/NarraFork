@@ -18,6 +18,7 @@ import {
 	validateStreamingEditOrigin,
 } from "@shared/streaming-edit-origin";
 import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
+import { captureCustomApiQuotaKeyPushTarget } from "../../services/provider-quota-push";
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
 import { beginNarratorResponseActivity } from "../../services/update-coordinator";
@@ -41,6 +42,8 @@ import {
 	getToolMessage,
 	type Locale,
 } from "../prompt-i18n";
+import { isCustomApiKeyOwner } from "../provider-keys";
+import { frozenQuotaTargetFor } from "../provider-quota-async";
 import { resolveProviderQuotaWait } from "../provider-quota-wait";
 import { createRequestRecording } from "../request-recorder";
 import {
@@ -4383,9 +4386,9 @@ async function* agentLoopInMetadataSnapshot(
 				if (requestFinished) return;
 				requestFinished = true;
 				streamExecutionOpen = false;
-				// An OpenCode Go request just spent (or was refused) allowance: schedule a
-				// throttled background `/usage` refresh so the status bar catches up.
-				// Fire-and-forget; a no-op for every other provider.
+				// A Custom API request just spent (or was refused) allowance: its compatibility
+				// activity hook now delegates to the shared, plugin-backed quota scheduler.
+				// Fire-and-forget; platform integrations and NUG remain no-ops here.
 				noteOpencodeUsageActivity(effectiveProvider);
 				if (!requestStarted) {
 					requestDump?.finish({
@@ -5221,6 +5224,8 @@ async function* agentLoopInMetadataSnapshot(
 						toolLoadingStrategy,
 						signal: attemptAbort.signal,
 						stickySessionKey: config.narratorId,
+						captureCustomApiQuotaTarget: (owner, keyId) =>
+							isCustomApiKeyOwner(owner) ? captureCustomApiQuotaKeyPushTarget(owner, keyId) : null,
 						reasoningEffort: config.reasoningEffort,
 						serviceTier: config.serviceTier,
 						metadata: config.metadata,
@@ -5873,6 +5878,8 @@ async function* agentLoopInMetadataSnapshot(
 						if (parsed.quotaBalance !== undefined) {
 							yield {
 								type: "quota_balance",
+								customApiQuotaTarget: frozenQuotaTargetFor(parsed),
+								credentialId,
 								quotaBalance: parsed.quotaBalance,
 								detailedQuotaBalance: parsed.detailedQuotaBalance,
 							};

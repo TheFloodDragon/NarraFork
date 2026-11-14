@@ -120,6 +120,11 @@ export interface ChatParams extends ProtocolChatParams {
 	 * paths that completed without ever contacting the API.
 	 */
 	onRequestStart?: (info?: { credentialId?: string }) => void;
+	/** Host-local capture at key selection, before request preparation can yield. */
+	captureCustomApiQuotaTarget?: (
+		providerId: string,
+		keyId: string,
+	) => import("../provider-quota-async").FrozenCustomApiQuotaTarget | null;
 	/** Complete final input counts; await bounded numeric preparation before sending/consuming output. */
 	onInputCharacters?: (counts: ContextInputCharacters | null) => void | Promise<void>;
 }

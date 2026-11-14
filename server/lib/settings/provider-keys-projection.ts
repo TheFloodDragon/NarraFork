@@ -13,7 +13,7 @@
  * owner id. Site tokens never join the inference pool. NUG OAuth client secrets and search
  * provider headers stay in settings.json for now.
  */
-import { getProviderKeyStore } from "../provider-keys";
+import { getProviderKeyStore, isCustomApiKeyOwner } from "../provider-keys";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import type { NarraForkSettings } from "./types";
 
@@ -39,6 +39,7 @@ interface KeySlot {
 function keySlots(settings: NarraForkSettings): KeySlot[] {
 	const slots: KeySlot[] = [];
 	for (const holder of settings.customApiProviders ?? []) {
+		if (!isCustomApiKeyOwner(holder.id)) continue;
 		slots.push({ owner: holder.id, pooled: true, holder, field: "apiKey", required: true });
 		slots.push({
 			owner: quotaKeyOwner(holder.id),
@@ -146,9 +147,11 @@ export function withoutProviderKeys(settings: NarraForkSettings): NarraForkSetti
 	const omit = <T extends { apiKey?: string }>({ apiKey: _secret, ...rest }: T) => rest;
 	return {
 		...settings,
-		customApiProviders: settings.customApiProviders?.map(
-			({ quotaAccessToken: _token, ...entry }) => ({ ...entry, apiKey: "" }),
-		),
+		customApiProviders: settings.customApiProviders?.map((entry) => {
+			if (!isCustomApiKeyOwner(entry.id)) return entry; // Keep rejected legacy config intact for repair.
+			const { quotaAccessToken: _token, ...rest } = entry;
+			return { ...rest, apiKey: "" };
+		}),
 		openaiProviders: blank(settings.openaiProviders),
 		anthropicProviders: blank(settings.anthropicProviders),
 		geminiProviders: blank(settings.geminiProviders),

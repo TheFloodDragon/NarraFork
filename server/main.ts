@@ -60,7 +60,7 @@ import { reloadSettings, reloadSettingsIfChanged, settings } from "./lib/setting
 import { startServerAddressWatcher } from "./lib/settings-address-watcher";
 import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
-import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
+import { injectSpaBaseHref, isSpaNavigationPath, spaIndexHeaders } from "./lib/spa-base-href";
 import { createStartupReadinessGate } from "./lib/startup-readiness";
 import { closeStartupStatus } from "./lib/startup-status";
 import { noPortAvailable, portUnavailable } from "./lib/startup-status/startup-problems";
@@ -75,14 +75,17 @@ import {
 	nextAllowedPort,
 	readWindowsExcludedPortRanges,
 } from "./lib/windows-excluded-ports";
-import { pluginManager } from "./services/plugin-manager";
+import { getBundledPluginDescriptors } from "./services/bundled-plugin-assets";
+import { initializePluginServices, pluginManager } from "./services/plugin-manager";
 import { pluginPlatformServices } from "./services/plugin-platform-services";
 import { listPluginProviderReadiness } from "./services/plugin-provider-readiness";
 import { pluginProviderRegistry } from "./services/plugin-provider-registry";
+import { pluginSourceService } from "./services/plugin-source-service";
 import {
 	activatePostgresRuntimeQueue,
 	composePostgresStores,
 } from "./services/postgres-composition";
+import { providerQuotaService } from "./services/provider-quota-service";
 import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
@@ -470,7 +473,7 @@ if (isProd) {
 				}
 
 				// SPA catch-all: serve index.html for non-file routes
-				if (indexPath && !c.req.path.includes(".")) {
+				if (indexPath && isSpaNavigationPath(c.req.path)) {
 					return serveSpaIndex(Bun.file(indexPath), c.req.path);
 				}
 
@@ -518,7 +521,7 @@ if (isProd) {
 			}
 
 			// SPA catch-all: serve index.html for non-file routes
-			if (!c.req.path.includes(".")) {
+			if (isSpaNavigationPath(c.req.path)) {
 				const indexFile = Bun.file(resolve(staticDir, "index.html"));
 				if (await indexFile.exists()) {
 					return serveSpaIndex(indexFile, c.req.path);
@@ -1006,33 +1009,6 @@ try {
 	logger.warn("Codex usage refresh scheduler startup failed", { error: String(err) });
 }
 
-try {
-	// One-shot warmup when Kimi providers exist; no periodic timer — refresh is
-	// demand-driven (stale-while-revalidate on GET /api/kimi/usages, plus a
-	// refresh when provider settings change).
-	const { refreshAllKimiUsages } = await import("./lib/kimi-usage-cache");
-	void refreshAllKimiUsages().catch(() => {});
-} catch (err) {
-	logger.warn("Kimi usage startup refresh failed", { error: String(err) });
-}
-
-try {
-	// Demand-driven warmup, like Kimi; usage is intentionally memory-only, so a
-	// restart re-reads it rather than trusting numbers from the previous process.
-	const { refreshAllOpencodeUsages } = await import("./lib/opencode-usage-cache");
-	void refreshAllOpencodeUsages().catch(() => {});
-} catch (err) {
-	logger.warn("OpenCode usage startup refresh failed", { error: String(err) });
-}
-
-try {
-	// Demand-driven warmup, like Kimi; balances are intentionally memory-only.
-	const { refreshAllDeepSeekBalances } = await import("./lib/deepseek-balance-cache");
-	void refreshAllDeepSeekBalances().catch(() => {});
-} catch {
-	logger.warn("DeepSeek balance startup refresh failed");
-}
-
 // Mark any stale terminals from a previous run as exited
 terminalService.recoverOnStartup().catch((err) => {
 	logger.error("Terminal recovery failed", { error: String(err) });
@@ -1046,12 +1022,21 @@ mcpManager.initialize().catch((err) => {
 
 // Initialize the plugin control plane after core services are available. Plugin
 // activation is feature-flagged and must never prevent the core server from starting.
-pluginManager
-	.initialize()
-	.then((statuses) => {
+initializePluginServices(pluginManager, getBundledPluginDescriptors(), {
+	startQuota: () => providerQuotaService.start(),
+	onBootstrapError: (descriptor, error) => {
+		logger.warn("Bundled plugin initialization failed", {
+			pluginId: descriptor.pluginId,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	},
+})
+	.then(async (started) => {
+		if (!started || pluginManager.isShuttingDown()) return;
+		pluginSourceService.start();
 		logger.info("Plugin manager initialized", {
 			enabled: pluginManager.isEnabled(),
-			pluginCount: statuses.length,
+			pluginCount: (await pluginManager.list()).length,
 		});
 	})
 	.catch((err) => {
@@ -1468,6 +1453,9 @@ async function performGracefulShutdown(
 	options: GracefulShutdownOptions,
 ): Promise<GracefulShutdownResult> {
 	if (shutdownPromise) return shutdownPromise;
+	// Fence startup synchronously, before quota.stop or any asynchronous teardown.
+	pluginSourceService.beginShutdown();
+	pluginManager.beginShutdown();
 	const startedAt = Date.now();
 	if (options.skipWindowsProcessTreeKill) {
 		killWindowsProcessTreeOnExit = false;
@@ -1592,6 +1580,8 @@ async function performGracefulShutdown(
 		// backend, so the SQLite teardown sequence is neither extended nor bypassed.
 		await shutdownStep(tracker, "postgresRuntime.close", () => closePostgresRuntime());
 		await shutdownStep(tracker, "vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
+		await shutdownStep(tracker, "pluginSourceService.stop", () => pluginSourceService.stop());
+		await shutdownStep(tracker, "providerQuotaService.stop", () => providerQuotaService.stop());
 		await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown());
 		unregisterExternalProviderResolver();
 		await shutdownStep(tracker, "mcpManager.shutdown", () => mcpManager.shutdown());

@@ -1,19 +1,27 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { EventEmitter } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { JsonRpcEnvelope } from "../../../server/lib/plugins/protocol";
+import { PluginPackageStore } from "../../../server/services/plugin-package-store";
 import {
 	buildLocalProcessCommand,
 	type ContentLengthFrameError,
 	ContentLengthFrameParser,
 	encodeContentLengthFrame,
 	LocalProcessRunner,
+	type PluginPackageStageWorker,
 	type PluginProcessHandle,
 	type PluginProcessSpawner,
 	type PluginRunner,
 	PluginRuntime,
+	PluginRuntimeError,
 	type RunnerProcess,
+	type RunnerStartOptions,
 	RuntimeSupervisor,
 	type RuntimeSupervisorOptions,
+	stagePluginPackage,
 } from "../../../server/services/plugin-runtime";
 
 const encoder = new TextEncoder();
@@ -234,7 +242,7 @@ class FakeRunner implements PluginRunner {
 		private readonly errorMethod?: LifecycleMethod,
 	) {}
 
-	async start(): Promise<PluginProcessHandle> {
+	async start(_options: RunnerStartOptions): Promise<PluginProcessHandle> {
 		const handle = new FakeProcessHandle(this.mode, this.errorMethod);
 		this.handles.push(handle);
 		setTimeout(() => {
@@ -257,11 +265,83 @@ const baseRuntimeOptions = {
 	pluginVersion: "1.0.0",
 	command: [bunPath, fixturePath],
 	cwd: fixtureCwd,
+	// These subprocesses are trusted test-owned fixtures, not installed plugins.
+	runner: new LocalProcessRunner({
+		allowedCwds: [fixtureCwd],
+		allowUnboundedResourceUsage: process.platform === "win32",
+	}),
 };
 
 afterEach(() => {
 	// Let process-exit microtasks and stream readers settle between tests.
 	return sleep(5);
+});
+
+describe("isolated package staging", () => {
+	it.each([
+		"creation",
+		"runtime",
+		"timeout",
+		"disabled",
+	] as const)("fails closed on %s without invoking PackageStore on the main thread", async (mode) => {
+		const root = await mkdtemp(join(tmpdir(), "plugin-stage-worker-"));
+		const install = spyOn(PluginPackageStore.prototype, "install");
+		const oldDisabled = process.env.NF_PLUGIN_PACKAGE_STAGE_DISABLED;
+		const events = new EventEmitter();
+		let terminated = 0;
+		const worker = Object.assign(events, {
+			postMessage() {
+				if (mode === "runtime")
+					queueMicrotask(() => events.emit("error", new Error("test Worker failure")));
+			},
+			async terminate() {
+				terminated++;
+				return 0;
+			},
+		}) as unknown as PluginPackageStageWorker;
+		try {
+			if (mode === "disabled") process.env.NF_PLUGIN_PACKAGE_STAGE_DISABLED = "1";
+			await expect(
+				stagePluginPackage(root, new Uint8Array([1, 2, 3]), {
+					timeoutMs: 30,
+					workerFactory: () => {
+						if (mode === "creation") throw new Error("test Worker unavailable");
+						return worker;
+					},
+				}),
+			).rejects.toThrow();
+			expect(install).not.toHaveBeenCalled();
+			expect(terminated).toBe(mode === "runtime" || mode === "timeout" ? 1 : 0);
+			expect((await new PluginPackageStore(root).readCurrent()).plugins).toEqual({});
+		} finally {
+			if (oldDisabled === undefined) delete process.env.NF_PLUGIN_PACKAGE_STAGE_DISABLED;
+			else process.env.NF_PLUGIN_PACKAGE_STAGE_DISABLED = oldDisabled;
+			install.mockRestore();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("stages a real package in the Worker without publishing current or running inline", async () => {
+		const root = await mkdtemp(join(tmpdir(), "plugin-stage-worker-"));
+		const install = spyOn(PluginPackageStore.prototype, "install");
+		try {
+			const result = await stagePluginPackage(
+				root,
+				join(import.meta.dir, "../../fixtures/plugins/packages/valid-package"),
+			);
+			expect(result).toMatchObject({
+				pluginId: "com.example.hello",
+				version: "1.0.0",
+				currentUpdated: false,
+				signatureIdentity: null,
+			});
+			expect(install).not.toHaveBeenCalled();
+			expect((await new PluginPackageStore(root).readCurrent()).plugins).toEqual({});
+		} finally {
+			install.mockRestore();
+			await rm(root, { recursive: true, force: true });
+		}
+	}, 15_000);
 });
 
 describe("ContentLengthFrameParser", () => {
@@ -389,6 +469,7 @@ describe("LocalProcessRunner", () => {
 				spawn: () => raw.process,
 				maxBodyBytes: constructorCap,
 				killProcessTree: false,
+				allowUnboundedResourceUsage: process.platform === "win32",
 			});
 			const handle = await runner.start({
 				command: ["fixture"],
@@ -464,13 +545,21 @@ describe("LocalProcessRunner", () => {
 			spawn,
 			allowedCwds: [fixtureCwd],
 			envAllowlist: ["PATH", "LANG"],
+			allowUnboundedResourceUsage: process.platform === "win32",
 		});
 		const handle = await runner.start({
 			command: ["bun", fixturePath, "normal"],
 			cwd: fixtureCwd,
 			env: { PATH: "/safe", LANG: "zh_CN.UTF-8", HOME: "/secret", JWT_SECRET: "jwt" },
 		});
-		expect(captured?.command).toEqual(buildLocalProcessCommand(["bun", fixturePath, "normal"]));
+		expect(captured?.command).toEqual(
+			buildLocalProcessCommand(
+				["bun", fixturePath, "normal"],
+				undefined,
+				process.platform,
+				process.platform === "win32",
+			),
+		);
 		expect(captured?.options.cwd).toBe(fixtureCwd);
 		expect(captured?.options.env).toEqual({ PATH: "/safe", LANG: "zh_CN.UTF-8" });
 		expect(captured?.options.detached).toBe(process.platform !== "win32");
@@ -512,6 +601,7 @@ describe("LocalProcessRunner", () => {
 			spawn: () => raw.process,
 			stderrRingBytes: 8,
 			maxStdoutBytes: 16,
+			allowUnboundedResourceUsage: process.platform === "win32",
 		});
 		const handle = await runner.start({
 			command: ["fixture"],
@@ -676,6 +766,26 @@ describe("PluginRuntime", () => {
 		await runtime.shutdown();
 	});
 
+	it("cancels the notification waiter when sending a shutdown control request throws synchronously", async () => {
+		const runtime = new PluginRuntime({ ...baseRuntimeOptions, runner: new FakeRunner() });
+		await runtime.start();
+		const connection = runtime.rpcConnection;
+		if (!connection) throw new Error("missing actual RPC connection");
+		const original = connection.request.bind(connection);
+		const send = spyOn(connection, "request").mockImplementation((method, params, options) => {
+			if (method === "shutdown") throw new Error("transport closed before shutdown write");
+			return original(method, params, options);
+		});
+		try {
+			await runtime.shutdown();
+			expect(runtime.state).toBe("stopped");
+			await Promise.resolve();
+		} finally {
+			send.mockRestore();
+			await runtime.shutdown();
+		}
+	});
+
 	it("drains and shuts down active requests", async () => {
 		const runner = new FakeRunner();
 		const runtime = new PluginRuntime({
@@ -728,6 +838,139 @@ describe("RuntimeSupervisor", () => {
 			},
 		};
 	}
+
+	it("rejects a cancelled options start before registering or spawning a runtime", async () => {
+		const supervisor = new RuntimeSupervisor();
+		const runner = new FakeRunner();
+		const controller = new AbortController();
+		controller.abort(new Error("cancelled before registration"));
+		try {
+			await expect(
+				supervisor.start({ ...baseRuntimeOptions, runner }, controller.signal),
+			).rejects.toThrow("cancelled before registration");
+			expect(supervisor.get(baseRuntimeOptions.pluginId)).toBeUndefined();
+			expect(runner.handles).toEqual([]);
+		} finally {
+			await supervisor.shutdown();
+		}
+	});
+
+	it("forwards options-start cancellation and cancels a failure-triggered restart", async () => {
+		const h = recoveryHarness();
+		const controller = new AbortController();
+		let entered!: () => void;
+		const entering = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const start = spyOn(h.runner, "start").mockImplementation(
+			(options) =>
+				new Promise<PluginProcessHandle>((_resolve, reject) => {
+					entered();
+					if (!options.signal) throw new Error("missing runner cancellation signal");
+					expect(options.signal).toBe(controller.signal);
+					options.signal.addEventListener("abort", () => reject(options.signal?.reason), {
+						once: true,
+					});
+				}),
+		);
+		const result = h.supervisor
+			.start({ ...baseRuntimeOptions, runner: h.runner }, controller.signal)
+			.then(
+				() => new Error("cancelled runtime unexpectedly became active"),
+				(error: unknown) => error,
+			);
+		try {
+			await entering;
+			controller.abort(
+				new PluginRuntimeError("cancelled during spawn", {
+					code: "START_CANCELLED",
+					kind: "transport",
+				}),
+			);
+			expect(await result).toMatchObject({ code: "START_CANCELLED" });
+			expect(h.supervisor.get(baseRuntimeOptions.pluginId)?.state).toBe("stopped");
+			expect(h.scheduled()).toHaveLength(1);
+			h.fire(0);
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(start).toHaveBeenCalledTimes(1);
+			expect(h.supervisor.get(baseRuntimeOptions.pluginId)?.state).toBe("stopped");
+		} finally {
+			controller.abort();
+			await result;
+			await h.cleanup();
+			start.mockRestore();
+		}
+	});
+
+	it("forwards options-activate cancellation to its own real child and waits for exit", async () => {
+		const supervisor = new RuntimeSupervisor();
+		const runner = new LocalProcessRunner({
+			allowedCwds: [fixtureCwd],
+			allowUnboundedResourceUsage: process.platform === "win32",
+		});
+		const controller = new AbortController();
+		let entered!: () => void;
+		let release!: () => void;
+		const entering = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let owned: PluginProcessHandle | undefined;
+		const originalStart = runner.start.bind(runner);
+		const start = spyOn(runner, "start").mockImplementation(async (options) => {
+			const child = await originalStart(options);
+			owned = child;
+			entered();
+			await gate;
+			return child;
+		});
+		const result = supervisor
+			.activate(
+				{
+					...baseRuntimeOptions,
+					command: [bunPath, fixturePath, "slow"],
+					runner,
+					idleTimeoutMs: 3_000,
+					totalTimeoutMs: 5_000,
+					timeouts: { handshakeMs: 2_000, activationMs: 1_000, shutdownMs: 500, drainMs: 50 },
+				},
+				controller.signal,
+			)
+			.then(
+				() => ({ completed: true as const }),
+				(error: unknown) => ({ completed: false as const, error }),
+			);
+		try {
+			await Promise.race([
+				entering,
+				result.then((outcome) => {
+					if (!outcome.completed) throw outcome.error;
+					throw new Error("runtime became active before the test gate");
+				}),
+			]);
+			const child = owned;
+			const pid = child?.pid;
+			if (!child || !pid) throw new Error("expected the test-owned child PID");
+			expect(start.mock.calls[0]?.[0].signal).toBe(controller.signal);
+			controller.abort(new Error("cancel test-owned child"));
+			release();
+			expect(await result).toMatchObject({ completed: false, error: expect.any(Error) });
+			await supervisor.shutdown();
+			await child.exited;
+			expect(() => process.kill(pid, 0)).toThrow();
+			expect(supervisor.get(baseRuntimeOptions.pluginId)?.state).toBe("stopped");
+		} finally {
+			controller.abort();
+			release();
+			await result;
+			await supervisor.shutdown();
+			await owned?.terminate?.("test cleanup");
+			start.mockRestore();
+		}
+	}, 15_000);
 
 	it("recovery counts error plus exit only once against the restart budget", async () => {
 		const h = recoveryHarness({ maxRestarts: 1, maxTotalRestarts: 10 });

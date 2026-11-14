@@ -64,6 +64,7 @@ import {
 import { narratorStore } from "./narrator-store";
 import { recordTurnStep, recordTurnToolCall } from "./narrator-turns";
 import { recordOutputChunk } from "./output-stats";
+import { type CustomApiQuotaPushTarget, customApiQuotaPushPrefix } from "./provider-quota-push";
 import { toolInputStreamSource } from "./tool-input-stream-source";
 
 /** Maps are scoped to this consumer/session, not globally to provider tool ids. */
@@ -340,6 +341,8 @@ export interface EventHandlerContext {
 	provider?: string;
 	/** Resolved model for the current turn */
 	model?: string;
+	/** Frozen Custom API identity for stream quota; null is an explicitly non-Custom-API pass. */
+	customApiQuotaTarget?: CustomApiQuotaPushTarget | null;
 
 	// --- Mutable state accessors ---
 	getContextUsagePct: () => number | undefined;
@@ -3239,18 +3242,48 @@ export async function processEvent(
 		}
 
 		case "quota_balance": {
+			if (event.customApiQuotaTarget !== undefined) {
+				if (!event.customApiQuotaTarget) {
+					if (ctx.customApiQuotaTarget) return null;
+				} else {
+					if (
+						ctx.customApiQuotaTarget &&
+						ctx.customApiQuotaTarget.providerId !== event.customApiQuotaTarget.providerId
+					)
+						return null;
+					ctx.customApiQuotaTarget = event.customApiQuotaTarget;
+				}
+			} else if (
+				ctx.customApiQuotaTarget?.keyId &&
+				event.credentialId &&
+				ctx.customApiQuotaTarget.keyId !== event.credentialId
+			) {
+				return null; // Unknown per-key provenance cannot be rebound when an event arrives.
+			}
+			// This identity was captured before the provider pass began. Never relabel a late
+			// old-account response with whichever provider currently owns the same prefix.
+			const customPrefix = ctx.customApiQuotaTarget
+				? customApiQuotaPushPrefix(ctx.customApiQuotaTarget)
+				: null;
+			if (ctx.customApiQuotaTarget && customPrefix === null) return null;
 			dualBroadcast(ctx, {
 				type: "quota_balance",
 				narratorId: broadcastTargetId,
+				customApiQuotaTarget: ctx.customApiQuotaTarget,
 				quotaBalance: event.quotaBalance,
 				detailedQuotaBalance: event.detailedQuotaBalance,
 			});
 			if (ctx.providerPrefix) {
-				updateCustomApiQuotaByPrefix(
-					ctx.providerPrefix,
-					event.quotaBalance,
-					event.detailedQuotaBalance,
-				);
+				if (ctx.customApiQuotaTarget !== null) {
+					updateCustomApiQuotaByPrefix(
+						customPrefix ?? ctx.providerPrefix,
+						event.quotaBalance,
+						event.detailedQuotaBalance,
+						ctx.customApiQuotaTarget?.generation,
+					);
+				}
+				// A captured Custom API pass cannot update a NUG provider that later takes its prefix.
+				if (ctx.customApiQuotaTarget) return null;
 				try {
 					const { updateNugQuotaByPrefix } = await import("../routes/nug");
 					if (event.quotaBalance != null) {
