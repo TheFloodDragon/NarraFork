@@ -144,6 +144,12 @@ export async function buildBundledPlugins(
 	const source = join(root, "plugins", "provider-quota");
 	await readManifest(join(source, "manifest.json"));
 	const outDir = resolve(options.outDir ?? join(source, "dist"));
+	const canonicalDist = resolve(source, "dist");
+	if (outDir !== canonicalDist && options.publishGenerated !== false) {
+		throw new Error(
+			"Bundled plugin generation cannot publish generated metadata from a non-canonical output directory",
+		);
+	}
 	const generatedDir = resolve(options.generatedDir ?? join(root, "server", "generated"));
 	// Only the package build recipe runs here, in an explicit build process. Its server entry
 	// remains inside the archive and is never imported into the NF runtime/module graph.

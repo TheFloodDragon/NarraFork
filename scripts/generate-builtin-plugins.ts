@@ -1,4 +1,4 @@
-import { link, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, writeFile } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 import {
 	buildBundledPlugins,
@@ -26,43 +26,30 @@ export const embeddedBuiltinPlugins: readonly EmbeddedBuiltinPackage[] = [];
 `;
 }
 
-/**
- * Shared by release and immutable local runtime builds. Build in an exclusive staging directory,
- * retain only a content-addressed archive, and return generated sources for in-memory interception.
- * No writes to server/generated or the shared plugin dist occur here; concurrent compilers can
- * safely keep using earlier archives while a new source revision is packaged.
- */
 async function buildPluginModules(checkout: string): Promise<Map<string, string>> {
 	const cache = join(checkout, ".narrafork", "bundled-plugin-build-assets");
 	await mkdir(cache, { recursive: true });
-	const staging = await mkdtemp(join(cache, "staging-"));
+	const built = await buildBundledPlugins({
+		root: checkout,
+		outDir: join(checkout, "plugins", "provider-quota", "dist"),
+		publishGenerated: false,
+	});
+	const asset = built.assets[0];
+	if (built.assets.length !== 1 || !asset)
+		throw new Error("Missing bundled Provider Quota archive");
+	const archivePath = join(cache, `${asset.sha256}.nfplugin`);
 	try {
-		const built = await buildBundledPlugins({
-			root: checkout,
-			outDir: staging,
-			publishGenerated: false,
-		});
-		const asset = built.assets[0];
-		if (built.assets.length !== 1 || !asset)
-			throw new Error("Missing bundled Provider Quota archive");
-		const archivePath = join(cache, `${asset.sha256}.nfplugin`);
-		try {
-			// The staged archive is complete and closed. Hard-link publication is atomic and exclusive.
-			await link(asset.archivePath, archivePath);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-		}
-		const stored = await bundledPluginArchiveIdentity(archivePath);
-		if (stored.size !== asset.size || stored.sha256 !== asset.sha256) {
-			throw new Error("Immutable bundled plugin build asset identity mismatch");
-		}
-		return new Map([
-			["embedded-builtin-plugins.ts", await renderBuiltinPluginModule(checkout)],
-			["embedded-bundled-plugins.ts", renderBundledPluginModule(asset, archivePath)],
-		]);
-	} finally {
-		await rm(staging, { recursive: true, force: true });
+		await link(asset.archivePath, archivePath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 	}
+	const stored = await bundledPluginArchiveIdentity(archivePath);
+	if (stored.size !== asset.size || stored.sha256 !== asset.sha256)
+		throw new Error("Immutable bundled plugin build asset identity mismatch");
+	return new Map([
+		["embedded-builtin-plugins.ts", await renderBuiltinPluginModule(checkout)],
+		["embedded-bundled-plugins.ts", renderBundledPluginModule(asset, archivePath)],
+	]);
 }
 
 const frozenBuilds = new Map<string, Promise<Map<string, string>>>();
