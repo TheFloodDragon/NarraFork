@@ -2388,10 +2388,13 @@ export async function drainInjectionsIntoHistory(
 	text: string;
 	parts: AgentInputPart[];
 	lastInputWasMailbox: boolean;
+	/** A real buffered user input, unlike background notices or reminders. */
+	startsUserTurn: boolean;
 	onConsumed: () => void;
 }> {
 	const narratorId = active.narratorId;
 	const parts: AgentInputPart[] = [];
+	let startsUserTurn = false;
 	const { buildPendingQuestionHint } = await import("./narrator-question-service");
 	const pendingQuestionHint = await buildPendingQuestionHint(narratorId);
 	if (pendingQuestionHint) parts.push({ text: pendingQuestionHint });
@@ -2487,6 +2490,7 @@ export async function drainInjectionsIntoHistory(
 			currentUserId: active._currentUserId,
 		});
 		if (consumed) {
+			startsUserTurn = true;
 			parts.push(...consumed.parts);
 			if (consumed.buffered.delivery) adoptedDeliveries.push(consumed.buffered.delivery);
 			if (consumed.buffered._mailboxConsumption)
@@ -2530,6 +2534,7 @@ export async function drainInjectionsIntoHistory(
 	return {
 		text: parts.map((part) => part.text).join("\n\n"),
 		parts,
+		startsUserTurn,
 		lastInputWasMailbox: adoptedDeliveries.some(
 			(delivery) => delivery.recipientMessageId === parts.at(-1)?.messageId,
 		),

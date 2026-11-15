@@ -11,6 +11,7 @@ import { db } from "../../db";
 import { narrators } from "../../db/schema";
 import { resolveProviderAndModel } from "../../lib/agent";
 import { analyzeShellCommand } from "../../lib/agent/bash-analyze";
+import { createProviderTurnContext } from "../../lib/agent/codex-turn-state";
 import { LOCAL_DEVICE_ID } from "../../lib/agent/execution/backend";
 import { projectFileReferenceText } from "../../lib/agent/file-reference-projection";
 import {
@@ -530,6 +531,7 @@ export async function runAgentLoopUnlocked(
 		const control = await applyForegroundControl(active, owner, profile, pass);
 		if (control.kind === "resume") {
 			resetForegroundTurn(active, profile);
+			runState.turnContext = createProviderTurnContext();
 			runState.input.text = control.prompt;
 			runState.pendingPrePromptBashCommand = control.prePromptBashCommand;
 			active._currentUserId = control.userId;
@@ -1311,6 +1313,10 @@ export async function runAgentLoopUnlocked(
 			let adoptedInput: { history: unknown[]; content: string } | undefined;
 			let afterToolsInput: { history: unknown[]; content: string; mailbox: boolean } | undefined;
 			const config: import("../../lib/agent").AgentConfig = {
+				// Retain one turn lock across retries, compact/history rebuilds and tool passes.
+				get turnContext() {
+					return runState.turnContext;
+				},
 				// Freeze this logical run's segment across every retry/compact pass.
 				executionSegmentId: profile.kind === "subagent" ? profile.executionSegmentId : undefined,
 				runtimePolicy,
@@ -1564,10 +1570,14 @@ export async function runAgentLoopUnlocked(
 				},
 				getAfterToolsInjections: async () => {
 					const input = await drainInjectionsIntoHistory(active, locale, subagentPlacement);
+					let consumed = false;
 					return {
 						...input,
 						onConsumed: () => {
+							if (consumed) return;
 							input.onConsumed();
+							consumed = true;
+							if (input.startsUserTurn) runState.turnContext = createProviderTurnContext();
 							if (input.parts.length > 0) {
 								lastModelInputWasMailbox = input.lastInputWasMailbox;
 								// onConsumed runs only once, whereas the exact same request can
@@ -2797,7 +2807,10 @@ export async function runAgentLoopUnlocked(
 					active._bufferSoftStopTaken = false;
 					runState.input.text = input.currentInput ?? input.prompt;
 					runState.pendingPrePromptBashCommand = input.prePromptBashCommand;
-					if (!input.preservePrincipal) active._currentUserId = input.userId ?? null;
+					if (!input.preservePrincipal) {
+						active._currentUserId = input.userId ?? null;
+						runState.turnContext = createProviderTurnContext();
+					}
 					active.conversationId = randomUUID();
 					active._resetUpstreamSessionOnNextRequest = true;
 					continue;
@@ -2919,6 +2932,7 @@ export async function runAgentLoopUnlocked(
 					);
 					if (goalCommand) {
 						await executeQueuedGoalCommand(narratorId, buffered, goalCommand.objective);
+						runState.turnContext = createProviderTurnContext();
 						active._continuationSuppressed = false;
 						active._continuationStallCount = 0;
 						active._continuationStallKey = undefined;
@@ -2999,6 +3013,7 @@ export async function runAgentLoopUnlocked(
 						createdBy: buffered.createdBy,
 					});
 					pendingBufferedDelivery = undefined;
+					runState.turnContext = createProviderTurnContext();
 					await cleanupBufferedTextFilesAsync(buffered._stagingId ?? buffered.id);
 					broadcastToNarrator(narratorId, {
 						type: "user_message",

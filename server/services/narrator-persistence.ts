@@ -2118,6 +2118,7 @@ const sqliteNarratorPersistence = {
 			| {
 					type: "text";
 					text: string;
+					providerMetadata?: import("@shared/agent-protocol/types").TextProviderMetadata;
 					outputIndex?: number;
 					citations?: import("@shared/citations").TextCitation[];
 					fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
@@ -2182,6 +2183,7 @@ const sqliteNarratorPersistence = {
 				| {
 						type: "text";
 						text: string;
+						providerMetadata?: import("@shared/agent-protocol/types").TextProviderMetadata;
 						outputIndex?: number;
 						citations?: import("@shared/citations").TextCitation[];
 						fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;

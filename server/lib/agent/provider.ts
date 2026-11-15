@@ -30,6 +30,7 @@ import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../token
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import { CodexProvider } from "./codex-provider";
+import type { ProviderTurnContext } from "./codex-turn-state";
 import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
 import { NugProvider } from "./nug-provider";
@@ -74,6 +75,8 @@ export interface ChatParams extends ProtocolChatParams {
 	 * For narrator loops this is narratorId.
 	 */
 	stickySessionKey?: string;
+	/** In-memory logical user turn, shared by tool continuations and recovery passes. */
+	turnContext?: ProviderTurnContext;
 	/** Reasoning effort level — maps to thinking config (Anthropic), reasoning config (Codex), or provider-specific effort ("max" may be provider-specific) */
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	/** Optional output ceiling; effective model metadata may lower, never raise it. */

@@ -408,6 +408,12 @@ export interface RunnerStartOptions {
 	onExit?: (exitCode: number) => void;
 	spawnTimeoutMs?: number;
 	idleTimeoutMs?: number;
+	/**
+	 * Fired when the idle budget decides to reclaim this process, immediately
+	 * before it is killed. An idle reclamation is a host budget decision, not a
+	 * plugin fault, so the runtime uses this to avoid reporting it as a crash.
+	 */
+	onIdleTimeout?: () => void;
 	totalTimeoutMs?: number;
 	maxStderrBytes?: number;
 	maxStderrBytesPerSecond?: number;
@@ -542,6 +548,7 @@ interface LocalProcessHandleOptions extends RunnerStartOptions {
 	killProcessTree: boolean;
 	maxHeaderBytes?: number;
 	maxBodyBytes?: number;
+	/** Host-to-plugin budget; must not enlarge the stdout parser limit. */
 	maxOutboundBodyBytes?: number;
 }
 
@@ -567,6 +574,7 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 	private stderrWindowBytes = 0;
 	private closed = false;
 	private killed = false;
+	private processExited = false;
 	private termination?: Promise<void>;
 	private idleTimer: ReturnType<typeof setTimeout> | undefined;
 	private totalTimer: ReturnType<typeof setTimeout> | undefined;
@@ -590,6 +598,7 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 			throw new RangeError("maxStderrBytesPerSecond must be a positive safe integer");
 		this.stderrRing = new ByteRingBuffer(options.stderrRingBytes);
 		this.exited = process.exited.then((exitCode) => {
+			this.processExited = true;
 			void this.finalizeExit(exitCode);
 			return exitCode;
 		});
@@ -815,6 +824,9 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 			kind: "timeout",
 			retryable: true,
 		});
+		// A descendant can hold stdout open after the plugin exits. Keep that
+		// transport failure on the recovery path instead of marking it as idle.
+		if (kind === "idle" && !this.processExited) this.options.onIdleTimeout?.();
 		this.emitError(error);
 		this.kill(`${kind} timeout`);
 	}
@@ -1132,6 +1144,8 @@ export interface PluginRuntimeOptions {
 	env?: Record<string, string | undefined>;
 	runtimeId?: string;
 	generation?: number;
+	/** Persisted supervisor recovery count carried into a new runtime instance. */
+	restartCount?: number;
 	rpcProtocol?: string;
 	hostApiVersion?: string;
 	grantedCapabilities?: readonly string[];
@@ -1186,6 +1200,11 @@ export interface RuntimeDiagnostics {
 	stderr: string;
 	lastError?: { code?: string; message: string; phase?: string };
 	lateMessages: number;
+	/**
+	 * Cumulative supervisor recovery attempts, initialized from persisted state.
+	 * On-demand starts only advance generation and do not increment this count.
+	 */
+	restartCount: number;
 	startedAt?: string;
 	stoppedAt?: string;
 }
@@ -1214,12 +1233,21 @@ export class PluginRuntime {
 	private lateMessages = 0;
 	private startedAt?: string;
 	private stoppedAt?: string;
+	/**
+	 * Generation whose process the host idle budget is retiring. An idle
+	 * reclamation is a host decision, not a plugin fault: reporting it as
+	 * crashed/failed would make the supervisor "recover" a process the host
+	 * itself stopped, producing an endless kill/respawn loop for idle plugins.
+	 */
+	private idleReclaimedGeneration?: number;
+	private _restarts: number;
 
 	constructor(options: PluginRuntimeOptions) {
 		this.pluginId = options.pluginId;
 		this.pluginVersion = options.pluginVersion ?? options.version;
 		this.runtimeId = options.runtimeId ?? `rt_${generateId(12)}`;
 		this._generation = options.generation ?? 0;
+		this._restarts = options.restartCount ?? 0;
 		this.options = options;
 		this.healthRegistry = options.healthRegistry ?? pluginHealthRegistry;
 		this.healthBreaker = this.healthRegistry.get(this.pluginId, undefined, "runtime");
@@ -1297,6 +1325,7 @@ export class PluginRuntime {
 		this.stoppedAt = undefined;
 		this.acceptingRequests = false;
 		this.negotiatedFeatures = [];
+		this.idleReclaimedGeneration = undefined;
 		this.setState("starting");
 		try {
 			this.handle = await this.runner.start({
@@ -1311,6 +1340,7 @@ export class PluginRuntime {
 				signal,
 				generation,
 				idleTimeoutMs: this.options.idleTimeoutMs,
+				onIdleTimeout: () => this.markIdleReclaim(generation),
 				totalTimeoutMs: this.options.totalTimeoutMs,
 				maxOutboundBodyBytes: this.options.maxOutboundFrameBytes ?? this.options.maxFrameBytes,
 			});
@@ -1448,11 +1478,14 @@ export class PluginRuntime {
 			});
 		} catch (error) {
 			const runtimeError = normalizeRuntimeError(error, "handshake");
-			this.recordHealth({
-				ok: false,
-				durationMs: Date.now() - operationStartedAt,
-				code: runtimeError.code,
-			});
+			const idleReclaimed = this.idleReclaimedGeneration === generation;
+			if (!idleReclaimed) {
+				this.recordHealth({
+					ok: false,
+					durationMs: Date.now() - operationStartedAt,
+					code: runtimeError.code,
+				});
+			}
 			this.lastError = runtimeError;
 			this.rejectAll(runtimeError);
 			this.clearSubscriptions();
@@ -1460,6 +1493,12 @@ export class PluginRuntime {
 				await this.handle.terminate("runtime start failed");
 			} else {
 				this.handle?.kill("runtime start failed");
+			}
+			if (idleReclaimed) {
+				this.acceptingRequests = false;
+				this.setState("stopped");
+				this.stoppedAt = new Date().toISOString();
+				return;
 			}
 			if ((this._state as RuntimeState) !== "quarantine") {
 				this.setState(
@@ -1476,6 +1515,7 @@ export class PluginRuntime {
 		if (this._state !== "stopped" && this._state !== "crashed" && this._state !== "failed") {
 			await this.shutdown();
 		}
+		this._restarts += 1;
 		await this.start(signal);
 	}
 
@@ -1667,6 +1707,7 @@ export class PluginRuntime {
 					}
 				: undefined,
 			lateMessages: this.lateMessages + (this.connection?.lateMessages ?? 0),
+			restartCount: this._restarts,
 			startedAt: this.startedAt,
 			stoppedAt: this.stoppedAt,
 		};
@@ -1745,6 +1786,14 @@ export class PluginRuntime {
 		return this.connection.createWaiter(predicate, timeoutMs, label);
 	}
 
+	/**
+	 * Records that the host idle budget is retiring this generation's process.
+	 * Called before the transport observes the kill.
+	 */
+	private markIdleReclaim(generation: number): void {
+		if (generation === this.generation) this.idleReclaimedGeneration = generation;
+	}
+
 	private handleProcessError(error: Error, generation: number): void {
 		if (generation !== this.generation) return;
 		this.lastError =
@@ -1756,6 +1805,18 @@ export class PluginRuntime {
 					})
 				: normalizeRuntimeError(error, "transport");
 		this.rejectAll(this.lastError);
+		if (this.idleReclaimedGeneration === generation) {
+			// Host-initiated idle reclamation: the process was stopped on purpose, so
+			// surfacing crashed/failed here would make the supervisor "recover" a
+			// process the host itself retired (an endless kill/respawn loop for idle
+			// provider plugins). Settle into `stopped` (mapped to inactive) instead;
+			// the next on-demand activation starts a fresh generation.
+			this.acceptingRequests = false;
+			this.clearSubscriptions();
+			if (this._state !== "draining" && this._state !== "stopped") this.setState("stopped");
+			this.stoppedAt = new Date().toISOString();
+			return;
+		}
 		if (this._state !== "draining" && this._state !== "stopped") this.setState("failed");
 	}
 
@@ -1766,6 +1827,15 @@ export class PluginRuntime {
 		}
 		if (this._state === "draining" || this._state === "stopped" || this._state === "quarantine")
 			return;
+		if (this.idleReclaimedGeneration === generation) {
+			// Host-initiated idle reclamation is not a crash: no `crashed` state, no
+			// onCrash, no supervisor restart. See handleProcessError.
+			this.acceptingRequests = false;
+			this.clearSubscriptions();
+			this.setState("stopped");
+			this.stoppedAt = new Date().toISOString();
+			return;
+		}
 		const error = new PluginRuntimeError(`Plugin process exited with code ${exitCode}`, {
 			code: "PROCESS_EXIT",
 			kind: "transport",

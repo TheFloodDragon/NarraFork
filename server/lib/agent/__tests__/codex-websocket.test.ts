@@ -6,6 +6,7 @@ import {
 	CodexWebSocketRetryableError,
 	type CompletedResponseSnapshot,
 	clearCodexResponsesWebSocketSessions,
+	codexWebSocketHandshakeDigest,
 	decidePrematureCodexReconnect,
 	extractTurnStateFromEvent,
 	hasRecentNarratorMessage,
@@ -67,6 +68,88 @@ describe("Codex Responses WebSocket helpers", () => {
 		expect(buildCodexResponsesWebSocketUrl("http://example.com/v1/responses")).toBe(
 			"ws://example.com/v1/responses",
 		);
+	});
+
+	test("handshake digest normalizes final headers and includes proxy credentials", () => {
+		const options = {
+			baseUrl: "https://relay.example/codex",
+			proxy: "http://user:one@proxy.example:8080",
+		};
+		const headers = { Authorization: "Bearer secret", "User-Agent": "test/1", "X-Marker": "yes" };
+		const digest = codexWebSocketHandshakeDigest(options, headers);
+		expect(digest).toHaveLength(64);
+		expect(digest).not.toContain("secret");
+		expect(
+			codexWebSocketHandshakeDigest(options, {
+				"x-marker": "yes",
+				"user-agent": "test/1",
+				authorization: "Bearer secret",
+			}),
+		).toBe(digest);
+		expect(
+			codexWebSocketHandshakeDigest(
+				{ ...options, proxy: "http://user:two@proxy.example:8080" },
+				headers,
+			),
+		).not.toBe(digest);
+		expect(
+			codexWebSocketHandshakeDigest(
+				{ ...options, baseUrl: "https://other.example/codex" },
+				headers,
+			),
+		).not.toBe(digest);
+	});
+
+	test("function-call projection ignores only native transport id/status and object key order", () => {
+		const lastRequest = makeRequest([makeUserMessage("hello")]);
+		const nativeCall = {
+			type: "function_call",
+			id: "fc-1",
+			status: "completed",
+			name: "lookup",
+			call_id: "call-1",
+			arguments: '{"path":"src/index.ts"}',
+		};
+		const replay = {
+			call_id: "call-1",
+			arguments: nativeCall.arguments,
+			name: "lookup",
+			type: "function_call",
+		};
+		const result = { type: "function_call_output", call_id: "call-1", output: "found" };
+		const lastCompleted = makeCompleted("resp-call", [nativeCall]);
+		const nextRequest = makeRequest([...lastRequest.input, replay, result] as OAIMessage[]);
+		const incremental = buildCodexResponsesWebSocketRequest(
+			nextRequest,
+			lastRequest,
+			lastCompleted,
+		);
+		expect(incremental.previous_response_id).toBe("resp-call");
+		expect(incremental.input).toEqual([result]);
+		for (const change of [
+			{ name: "different" },
+			{ call_id: "call-2" },
+			{ arguments: '{"path":"different"}' },
+			{ phase: "commentary" },
+			{ future_field: "unknown" },
+		]) {
+			const changed = makeRequest([
+				...lastRequest.input,
+				{ ...replay, ...change },
+				result,
+			] as OAIMessage[]);
+			const full = buildCodexResponsesWebSocketRequest(changed, lastRequest, lastCompleted);
+			expect(full.previous_response_id).toBeUndefined();
+			expect(full.input).toEqual(changed.input);
+		}
+		for (const extra of [{ phase: "final_answer" }, { future_field: "native-extension" }]) {
+			const full = buildCodexResponsesWebSocketRequest(
+				nextRequest,
+				lastRequest,
+				makeCompleted("resp-call", [{ ...nativeCall, ...extra }]),
+			);
+			expect(full.previous_response_id).toBeUndefined();
+		}
 	});
 
 	test("reuses previous_response_id when input extends last request baseline", () => {

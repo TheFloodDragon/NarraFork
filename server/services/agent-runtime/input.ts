@@ -1,3 +1,7 @@
+import {
+	createProviderTurnContext,
+	type ProviderTurnContext,
+} from "../../lib/agent/codex-turn-state";
 import type { ImageRef } from "../../lib/uploads";
 import type { CustomSubagentDef } from "../custom-subagent-service";
 import type { ExecuteLoopResult } from "../narrator-executor";
@@ -47,6 +51,8 @@ export type RuntimeInput =
 /** One mutable run state shared across retries, compacts and user-control resumes. */
 export interface RuntimeRunState {
 	input: Extract<RuntimeInput, { kind: "current" }>;
+	/** Memory-only; distinct from durable execution/conversation identity. */
+	turnContext: ProviderTurnContext;
 	recovery: RuntimeRecoveryState;
 	lastPass?: ExecuteLoopResult;
 	firstPass: boolean;
@@ -65,6 +71,7 @@ export function createRuntimeRunState(
 ): RuntimeRunState {
 	return {
 		input,
+		turnContext: createProviderTurnContext(),
 		recovery: createRuntimeRecoveryState(),
 		firstPass: true,
 		initialSettingsApplied: false,

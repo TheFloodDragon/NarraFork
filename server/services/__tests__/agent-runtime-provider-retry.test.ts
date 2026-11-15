@@ -282,33 +282,62 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 			options.config.onModelInputConsumed?.(options.history, options.userText);
 			expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(false);
 			for (const step of [
-				{ parts: [{ text: "mailbox update" }], mailbox: true, before: false, after: true },
-				{ parts: [], mailbox: false, before: true, after: true },
-				{ parts: [{ text: "ordinary guidance" }], mailbox: false, before: true, after: false },
+				{
+					parts: [{ text: "mailbox update" }],
+					mailbox: true,
+					startsUserTurn: false,
+					before: false,
+					after: true,
+				},
+				{ parts: [], mailbox: false, startsUserTurn: false, before: true, after: true },
+				{
+					parts: [{ text: "ordinary guidance" }],
+					mailbox: false,
+					startsUserTurn: false,
+					before: true,
+					after: false,
+				},
+				{
+					parts: [{ text: "buffered user message" }],
+					mailbox: false,
+					startsUserTurn: true,
+					before: false,
+					after: false,
+				},
 			]) {
 				drain.mockResolvedValueOnce({
 					text: step.parts.map((part) => part.text).join("\n"),
 					parts: step.parts,
 					lastInputWasMailbox: step.mailbox,
+					startsUserTurn: step.startsUserTurn,
 					onConsumed: consumed,
 				});
 				const input = await options.config.getAfterToolsInjections?.();
 				if (!input || typeof input === "string") throw new Error("Expected structured drain input");
 				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(step.before);
+				const previousTurn = options.config.turnContext;
 				input.onConsumed?.();
 				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(step.after);
-				// Provider retries re-adopt the same packet, but do not repeat onConsumed.
+				if (step.startsUserTurn) {
+					expect(options.config.turnContext).not.toBe(previousTurn);
+					expect(options.config.turnContext?.id).not.toBe(previousTurn?.id);
+				} else {
+					expect(options.config.turnContext).toBe(previousTurn);
+				}
+				// Adoption is one-shot; retries cannot replace a newly started logical turn.
+				input.onConsumed?.();
+				expect(options.config.turnContext?.id).toBeTruthy();
 				options.config.onModelInputConsumed?.(options.history, options.userText);
 				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(step.after);
 			}
-			expect(consumed).toHaveBeenCalledTimes(3);
+			expect(consumed).toHaveBeenCalledTimes(4);
 			options.config.onModelInputConsumed?.(options.history, "a new user turn");
 			expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(false);
 			return { ...reasoningIdleResult, reasoningOnlyIdle: false };
 		});
 		const outcome = await runAgentLoopUnlocked(active, owner, "ordinary input", undefined, profile);
 		expect(execute).toHaveBeenCalledTimes(1);
-		expect(drain).toHaveBeenCalledTimes(3);
+		expect(drain).toHaveBeenCalledTimes(4);
 		expect(outcome.hasError).toBe(false);
 	});
 });
@@ -489,8 +518,12 @@ describe("provider retry policy is identical through the real primary and child 
 				activeNarrators.set(id, active);
 				const owner = tryClaimExecution(id, kind);
 				if (!owner) throw new Error("Missing retry owner");
-				const calls: Array<{ packet: string; conversation: string; reset: boolean | undefined }> =
-					[];
+				const calls: Array<{
+					packet: string;
+					conversation: string;
+					reset: boolean | undefined;
+					turnContext: ExecuteLoopOptions["config"]["turnContext"];
+				}> = [];
 				spyOn(executor, "executeAgentLoop").mockImplementation(
 					async (options: ExecuteLoopOptions) => {
 						const runtimePolicy = options.config.runtimePolicy;
@@ -506,6 +539,7 @@ describe("provider retry policy is identical through the real primary and child 
 							}),
 							conversation: options.config.conversationId,
 							reset: options.config.resetUpstreamSessionOnFirstRequest,
+							turnContext: options.config.turnContext,
 						});
 						if (calls.length > 2) throw new Error("Unexpected extra retry or continuation");
 						return calls.length === 1
@@ -543,6 +577,8 @@ describe("provider retry policy is identical through the real primary and child 
 				if (mode === "responses") {
 					// Recovery must keep conversationId so prompt_cache_key stays stable.
 					expect(calls[1].conversation).toBe(calls[0].conversation);
+					expect(calls[0].turnContext?.id).toBeTruthy();
+					expect(calls[1].turnContext).toBe(calls[0].turnContext);
 					expect(calls[1].reset).toBe(true);
 					expect(outcome.finalText).toBe("finished");
 				} else {
