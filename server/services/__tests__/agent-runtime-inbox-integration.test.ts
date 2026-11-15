@@ -861,6 +861,7 @@ test("child after-tools parts separate the durable buffered input and its knowle
 			})),
 		);
 		expect(projected.parts.map((part) => part.text).join("\n\n")).toBe(projected.text);
+		expect(projected.startsUserTurn).toBe(true);
 		expect(projected.parts[0]?.messageId).not.toBe(accepted.id);
 		expect(projected.parts[0]?.messageId).not.toBe(projected.parts[1]?.messageId);
 		expect(userMessage.parentToolUseId).toBe("origin");
@@ -1004,6 +1005,7 @@ test("real parent after-tools notice callback is the adoption boundary, includin
 	failBroadcast = false;
 	expect(projected.text).toContain("This notice could not load the result.");
 	expect(projected.text).toContain("Await(");
+	expect(projected.startsUserTurn).toBe(false);
 	expect(projected.parts).toEqual([
 		{ text: projected.text, messageId: required(state(row.id)?.currentMessageId) },
 	]);

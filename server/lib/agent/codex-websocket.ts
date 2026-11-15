@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Agent as HttpAgent, IncomingMessage } from "node:http";
 import {
 	CYBER_POLICY_VIOLATION_CODE,
@@ -17,6 +18,14 @@ import {
 	stripResponsesLiteHeader,
 } from "../user-agent";
 import { deriveCodexWindowId } from "./codex-request";
+import {
+	type CodexTurnState,
+	extractCodexTurnStateFromEvent,
+	getCodexTurnState,
+	normalizedCodexHeaders,
+	type ProviderTurnContext,
+	redactCodexTurnStateInJsonText,
+} from "./codex-turn-state";
 import { parseErrorDiagnostics, parseUpstreamErrorEnvelope } from "./error-diagnostics";
 import { ProviderInvalidStateError } from "./error-handling";
 import { parseGatewayDataEvent } from "./gateway-events";
@@ -141,7 +150,8 @@ interface CachedSession {
 	disabled: boolean;
 	lastRequest: CodexResponsesRequestBody | null;
 	lastCompleted: CompletedResponseSnapshot | null;
-	turnState: string | null;
+	/** Digest only: never retain handshake credentials in session metadata. */
+	handshakeDigest: string | null;
 	busy: boolean;
 	lastUsedAt: number;
 }
@@ -174,6 +184,8 @@ export interface StreamCodexResponsesWebSocketOptions {
 	sessionKey: string;
 	/** Stable conversation/thread identity sent in headers and request metadata. */
 	conversationId: string;
+	/** Memory-only logical user turn; absent callers get an isolated request lock. */
+	turnContext?: ProviderTurnContext;
 	narratorId?: string;
 	credentialId: string;
 	model: string;
@@ -252,14 +264,50 @@ function cloneJson<T>(value: T): T {
 	return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function itemSignature(value: unknown): string {
-	return JSON.stringify(value);
+function jsonValuesMatch(left: unknown, right: unknown): boolean {
+	if (left === right) return true;
+	if (Array.isArray(left)) {
+		return (
+			Array.isArray(right) &&
+			left.length === right.length &&
+			left.every((value, index) => jsonValuesMatch(value, right[index]))
+		);
+	}
+	if (
+		!left ||
+		!right ||
+		typeof left !== "object" ||
+		typeof right !== "object" ||
+		Array.isArray(right)
+	) {
+		return false;
+	}
+	const leftRecord = left as Record<string, unknown>;
+	const rightRecord = right as Record<string, unknown>;
+	const keys = Object.keys(leftRecord);
+	return (
+		keys.length === Object.keys(rightRecord).length &&
+		keys.every(
+			(key) =>
+				Object.hasOwn(rightRecord, key) && jsonValuesMatch(leftRecord[key], rightRecord[key]),
+		)
+	);
+}
+
+function replayComparableItem(value: unknown): unknown {
+	const item = asRecord(value);
+	if (item?.type !== "function_call") return value;
+	// Completed function-call output includes transport id/status, but provider
+	// replay deliberately retains the semantic call_id/name/arguments instead.
+	// Never omit phase or unknown fields: a mismatch must force a safe full send.
+	const { id: _id, status: _status, ...semanticItem } = item;
+	return semanticItem;
 }
 
 function isPrefixExtension(baseline: unknown[], input: unknown[]): boolean {
 	if (baseline.length > input.length) return false;
 	for (let i = 0; i < baseline.length; i++) {
-		if (itemSignature(baseline[i]) !== itemSignature(input[i])) {
+		if (!jsonValuesMatch(replayComparableItem(baseline[i]), replayComparableItem(input[i]))) {
 			return false;
 		}
 	}
@@ -507,7 +555,7 @@ function createSessionState(): CachedSession {
 		disabled: false,
 		lastRequest: null,
 		lastCompleted: null,
-		turnState: null,
+		handshakeDigest: null,
 		busy: false,
 		lastUsedAt: Date.now(),
 	};
@@ -622,18 +670,7 @@ export function buildHandshakeHeaders(
  * Exported for tests: a miss here is invisible until same-turn requests start
  * landing on different backends.
  */
-export function extractTurnStateFromEvent(chunk: Record<string, unknown>): string | null {
-	const type = chunk.type;
-	if (type !== "response.metadata" && type !== "codex.response.metadata") return null;
-	const headers = asRecord(chunk.headers);
-	if (!headers) return null;
-	for (const [name, value] of Object.entries(headers)) {
-		if (name.toLowerCase() !== TURN_STATE_HEADER) continue;
-		if (typeof value === "string" && value) return value;
-		if (typeof value === "number") return String(value);
-	}
-	return null;
-}
+export const extractTurnStateFromEvent = extractCodexTurnStateFromEvent;
 
 function asRecord(value: unknown): Record<string, unknown> | null {
 	return value && typeof value === "object" && !Array.isArray(value)
@@ -750,7 +787,7 @@ export function buildCodexResponsesWebSocketRequest(
 
 	const previousWithoutInput = requestWithoutInput(lastRequest);
 	const currentWithoutInput = requestWithoutInput(fullRequest);
-	if (itemSignature(previousWithoutInput) !== itemSignature(currentWithoutInput)) {
+	if (!jsonValuesMatch(previousWithoutInput, currentWithoutInput)) {
 		return { type: "response.create", ...fullRequest };
 	}
 
@@ -800,6 +837,7 @@ export function applyTurnStateToRequest(
 }
 
 async function closeSessionConnection(session: CachedSession): Promise<void> {
+	session.handshakeDigest = null;
 	if (session.connection) {
 		await session.connection.close();
 		session.connection = null;
@@ -810,7 +848,6 @@ async function resetSession(session: CachedSession, disable = false): Promise<vo
 	await closeSessionConnection(session);
 	session.lastRequest = null;
 	session.lastCompleted = null;
-	session.turnState = null;
 	session.disabled = disable;
 }
 
@@ -818,11 +855,9 @@ async function resetSession(session: CachedSession, disable = false): Promise<vo
  * Close the socket and forget the `previous_response_id` chain, keeping the
  * session entry itself alive.
  *
- * Distinct from {@link resetSession} only in that `turnState` survives: the
- * sticky-routing token belongs to the TURN, not to the connection, and upstream
- * expects it replayed on every request of that turn — including the ones sent
- * over a replacement socket after a reconnect. Clearing it on reconnect would
- * silently drop same-turn backend affinity.
+ * Unlike resetSession, this leaves the disabled flag alone. Neither operation
+ * owns turn-state: its OnceLock lives with the logical turn and survives socket
+ * resets, history rebuilds and same-turn HTTP fallback.
  */
 async function discardResponseChain(session: CachedSession): Promise<void> {
 	await closeSessionConnection(session);
@@ -846,7 +881,7 @@ function recordWebSocketMessage(
 	collector?.frame({
 		direction: "response",
 		type: `websocket.${incoming.type}`,
-		text: incoming.type === "message" ? incoming.text : undefined,
+		text: incoming.type === "message" ? redactCodexTurnStateInJsonText(incoming.text) : undefined,
 		metadata: {
 			connectionId,
 			boundary: "websocket-message-not-network-frame",
@@ -855,7 +890,7 @@ function recordWebSocketMessage(
 		},
 	});
 	if (incoming.type === "message") {
-		collector?.appendResponseText(incoming.text, false);
+		collector?.appendResponseText(redactCodexTurnStateInJsonText(incoming.text), false);
 		collector?.appendResponseText("\n", false);
 	} else if (incoming.type === "close") {
 		collector?.appendResponseText(
@@ -876,14 +911,15 @@ class ReusableWebSocketConnection {
 	/** Wall-clock time the upgrade completed, for the 60-minute lifetime cap. */
 	private connectedAt = 0;
 
-	constructor(
-		private readonly url: string,
-		private readonly headers: Record<string, string>,
-		private readonly proxy?: string,
-		private readonly onUpgrade?: (response: IncomingMessage) => void,
-	) {}
-
-	async connect(signal: AbortSignal): Promise<void> {
+	async connect(
+		signal: AbortSignal,
+		handshake: {
+			url: string;
+			headers: Record<string, string>;
+			proxy?: string;
+			onUpgrade: (response: IncomingMessage) => void;
+		},
+	): Promise<void> {
 		const { default: WebSocketImpl } = await import("ws");
 		if (signal.aborted) {
 			throw createCodexWebSocketAbortError();
@@ -891,12 +927,12 @@ class ReusableWebSocketConnection {
 		await new Promise<void>((resolve, reject) => {
 			let settled = false;
 			const wsOptions: { headers: Record<string, string>; agent?: boolean | HttpAgent } = {
-				headers: this.headers,
+				headers: handshake.headers,
 			};
-			if (this.proxy) {
-				wsOptions.agent = new HttpsProxyAgent(this.proxy);
+			if (handshake.proxy) {
+				wsOptions.agent = new HttpsProxyAgent(handshake.proxy);
 			}
-			const ws = new WebSocketImpl(this.url, wsOptions);
+			const ws = new WebSocketImpl(handshake.url, wsOptions);
 			this.ws = ws;
 
 			// A TCP connect that neither completes nor errors (silent drop by a proxy or
@@ -950,10 +986,10 @@ class ReusableWebSocketConnection {
 			};
 
 			ws.once("upgrade", (response) => {
-				this.onUpgrade?.(response);
+				handshake.onUpgrade(response);
 			});
 			ws.once("unexpected-response", (_request, response) => {
-				this.onUpgrade?.(response);
+				handshake.onUpgrade(response);
 				const status = response.statusCode;
 				const message = `Codex WebSocket upgrade failed with status ${status ?? "unknown"}`;
 				finishReject(
@@ -1094,15 +1130,34 @@ class ReusableWebSocketConnection {
 	}
 }
 
+/** Fingerprint final wire settings without retaining plaintext authorization or proxy secrets. */
+export function codexWebSocketHandshakeDigest(
+	options: Pick<StreamCodexResponsesWebSocketOptions, "baseUrl" | "proxy">,
+	headers: Record<string, string>,
+): string {
+	return createHash("sha256")
+		.update(
+			JSON.stringify([
+				buildCodexResponsesWebSocketUrl(options.baseUrl),
+				options.proxy ? new URL(options.proxy).toString() : "",
+				normalizedCodexHeaders(headers),
+			]),
+		)
+		.digest("hex");
+}
+
 async function ensureConnection(
 	session: CachedSession,
 	options: StreamCodexResponsesWebSocketOptions,
-	handshakeHeaders?: Record<string, string>,
+	handshakeHeaders: Record<string, string>,
+	turnState: CodexTurnState,
 ): Promise<ReusableWebSocketConnection> {
 	if (options.signal.aborted) {
 		throw createCodexWebSocketAbortError();
 	}
+	const handshakeDigest = codexWebSocketHandshakeDigest(options, handshakeHeaders);
 	if (
+		session.handshakeDigest === handshakeDigest &&
 		session.connection?.isOpen() &&
 		!session.connection.isExpiring() &&
 		!session.connection.hasPendingFrames()
@@ -1128,11 +1183,14 @@ async function ensureConnection(
 		throw createCodexWebSocketAbortError();
 	}
 	const url = buildCodexResponsesWebSocketUrl(options.baseUrl);
-	const connection = new ReusableWebSocketConnection(
+	const connection = new ReusableWebSocketConnection();
+	connection.onFrame = (incoming) =>
+		recordWebSocketMessage(options.requestDump, connection.id, incoming);
+	await connection.connect(options.signal, {
 		url,
-		handshakeHeaders ?? buildHandshakeHeaders(options),
-		options.proxy,
-		(response) => {
+		headers: handshakeHeaders,
+		proxy: options.proxy,
+		onUpgrade: (response) => {
 			connection.handshakeMeta = {
 				status: response.statusCode,
 				headers: sanitizeHeaders(response.headers),
@@ -1143,25 +1201,21 @@ async function ensureConnection(
 				type: response.statusCode === 101 ? "websocket.upgrade" : "websocket.upgrade_rejected",
 				metadata: { connectionId: connection.id, reused: false, ...connection.handshakeMeta },
 			});
-			const turnState = response.headers[TURN_STATE_HEADER];
-			if (response.statusCode === 101 && typeof turnState === "string" && turnState) {
-				session.turnState = turnState;
+			if (response.statusCode === 101) {
+				turnState.capture(response.headers[TURN_STATE_HEADER]);
 			}
 		},
-	);
-	connection.onFrame = (incoming) =>
-		recordWebSocketMessage(options.requestDump, connection.id, incoming);
-	await connection.connect(options.signal);
+	});
 	if (options.signal.aborted) {
 		await connection.close();
 		throw createCodexWebSocketAbortError();
 	}
 	session.connection = connection;
+	session.handshakeDigest = handshakeDigest;
 	logger.info("Codex Responses WebSocket connected", {
 		sessionKey: options.sessionKey,
 		credentialId: options.credentialId,
 		model: options.model,
-		url,
 	});
 	return connection;
 }
@@ -1216,6 +1270,11 @@ export async function* streamCodexResponsesWebSocket(
 		let previousResponseRetries = 0;
 		let hasYieldedEvents = false;
 		const handshakeHeaders = buildHandshakeHeaders(options);
+		const turnState = getCodexTurnState(options.turnContext, {
+			baseUrl: options.baseUrl,
+			credentialId: options.credentialId,
+			headers: handshakeHeaders,
+		});
 		let requestReported = false;
 		const beginAttempt = () =>
 			options.requestDump?.beginResponseAttempt({
@@ -1242,25 +1301,34 @@ export async function* streamCodexResponsesWebSocket(
 				session.lastRequest,
 				session.lastCompleted,
 			);
-			applyTurnStateToRequest(body, session.turnState);
+			if (options.turnContext) {
+				body.client_metadata = {
+					...(body.client_metadata as Record<string, unknown> | undefined),
+					turn_id: options.turnContext.id,
+				};
+			}
+			applyTurnStateToRequest(body, turnState.value);
 			return { body, text: JSON.stringify(body) };
 		};
 
 		const dispatchRequest = async (): Promise<void> => {
 			const frame = buildRequestFrame();
+			const evidenceText = options.requestDump
+				? redactCodexTurnStateInJsonText(frame.text)
+				: frame.text;
 			options.requestDump?.setRequest(
 				{
 					transport: "websocket",
 					url: buildCodexResponsesWebSocketUrl(options.baseUrl),
 					headers: sanitizeHeaders(handshakeHeaders),
-					bodyText: frame.text,
+					bodyText: evidenceText,
 				},
 				false,
 			);
 			options.requestDump?.frame({
 				direction: "request",
 				type: "websocket.message",
-				text: frame.text,
+				text: evidenceText,
 				metadata: { connectionId: connection?.id, boundary: "websocket-message-not-network-frame" },
 			});
 			// Preserve the legacy first-dispatch observer contract. The collector above
@@ -1298,7 +1366,7 @@ export async function* streamCodexResponsesWebSocket(
 			toolAccum = new Map();
 			reasoningAccum = new Map();
 			touchSession(session);
-			connection = await ensureConnection(session, options, handshakeHeaders);
+			connection = await ensureConnection(session, options, handshakeHeaders, turnState);
 			if (options.signal.aborted) {
 				await resetSession(session, false);
 				return false;
@@ -1399,7 +1467,7 @@ export async function* streamCodexResponsesWebSocket(
 			});
 		};
 
-		connection = await ensureConnection(session, options, handshakeHeaders);
+		connection = await ensureConnection(session, options, handshakeHeaders, turnState);
 		if (options.signal.aborted) {
 			yield { silentDisconnect: true };
 			return;
@@ -1709,9 +1777,7 @@ export async function* streamCodexResponsesWebSocket(
 			// connection, so a reused connection (the normal case for every request after
 			// the first in a turn) learned the token nowhere and dropped sticky routing.
 			const eventTurnState = extractTurnStateFromEvent(chunk as Record<string, unknown>);
-			if (eventTurnState) {
-				session.turnState = eventTurnState;
-			}
+			turnState.capture(eventTurnState);
 
 			if (chunk.type === "response.created" && chunk.response?.id) {
 				responseId = String(chunk.response.id);
@@ -1782,8 +1848,7 @@ export async function* streamCodexResponsesWebSocket(
 				!session.disabled &&
 				session.connection === null &&
 				session.lastRequest === null &&
-				session.lastCompleted === null &&
-				session.turnState === null;
+				session.lastCompleted === null;
 			if (canDiscardSession) {
 				sessionCache.delete(cacheKey);
 				stopSessionCleanupTimerIfIdle();

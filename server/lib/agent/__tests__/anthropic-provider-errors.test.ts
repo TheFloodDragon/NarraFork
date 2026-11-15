@@ -422,6 +422,70 @@ describe("Anthropic lightweight partial output regression", () => {
 });
 
 describe("parseAnthropicSSEStream end-to-end error surfacing", () => {
+	test("multiline JSON and EOF-only errors retain their event name", async () => {
+		const events = await collect(
+			parseAnthropicSSEStream(
+				sseStream('event:error\rdata:{\rdata:"message":"EOF backend failure"\rdata:}'),
+			),
+		);
+		expect(events[0]?.invalidState?.message).toBe("EOF backend failure");
+	});
+
+	test("legacy adjacent JSON data lines still stream independently", async () => {
+		const events = await collect(
+			parseAnthropicSSEStream(
+				sseStream(
+					'data:{"type":"message_start","message":{"id":"legacy"}}\n' +
+						'data:{"type":"content_block_delta","delta":{"type":"text_delta","text":"old relay"}}\n',
+				),
+			),
+		);
+		expect(events.some((event) => event.messageId === "legacy")).toBe(true);
+		expect(events.some((event) => event.text === "old relay")).toBe(true);
+	});
+
+	test("a throwing generation callback propagates and cancels its reader", async () => {
+		let cancellations = 0;
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(
+					new TextEncoder().encode(
+						'data:{"type":"content_block_delta","delta":{"type":"text_delta","text":"visible"}}\n\n',
+					),
+				);
+			},
+			cancel() {
+				cancellations++;
+			},
+		});
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(body, {
+				headers: { "content-type": "text/event-stream" },
+			})) as unknown as typeof fetch;
+		const failure = new Error("consumer callback failure");
+		try {
+			const provider = new AnthropicProvider({
+				id: "test-anthropic",
+				name: "Test Anthropic",
+				prefix: "anthropic",
+				apiKey: "test-key",
+				baseUrl: "https://example.com/v1",
+			});
+			await expect(
+				provider.generateWithMeta("prompt", "anthropic:claude-test", undefined, {
+					onTextDelta: () => {
+						throw failure;
+					},
+				}),
+			).rejects.toBe(failure);
+			expect(cancellations).toBe(1);
+			expect(body.locked).toBe(false);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
 	test("event: error with type-less data still surfaces invalidState", async () => {
 		// This is exactly the gateway's writeSSEError output shape before the fix:
 		// an `event: error` line with a data payload that has no `type` field.

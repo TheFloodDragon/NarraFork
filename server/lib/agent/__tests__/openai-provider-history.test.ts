@@ -76,6 +76,149 @@ function makeUserMessage(overrides: Partial<DbMessage> = {}): DbMessage {
 	};
 }
 
+describe("native Responses message phase continuation", () => {
+	test("interleaved item/part metadata and late phase survive live and stored replay", async () => {
+		const tools = new Map();
+		const reasoning = new Map();
+		const content = new OutputContentAccumulator();
+		const frames = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "message", role: "assistant", id: "msg_a", phase: "commentary" },
+			},
+			{ type: "response.output_text.delta", output_index: 0, content_index: 0, delta: " first " },
+			{ type: "response.output_text.delta", output_index: 0, content_index: 1, delta: "second" },
+			{
+				type: "response.output_item.added",
+				output_index: 1,
+				item: { type: "message", role: "assistant", id: "msg_b", phase: "final_answer" },
+			},
+			{ type: "response.output_text.delta", item_id: "msg_b", content_index: 0, delta: "answer" },
+			{
+				type: "response.output_item.done",
+				item: { type: "message", role: "assistant", id: "msg_a", phase: "partial_answer" },
+			},
+			{ type: "response.completed", response: { status: "completed", end_turn: false } },
+		];
+		const events = frames.flatMap((frame) => parseResponsesAPIEvent(frame, tools, reasoning));
+		const late = events.filter((event) => event.textMetadata?.openai?.phase === "partial_answer");
+		expect(late.map((event) => event.textMetadata?.openai?.contentIndex)).toEqual([0, 1]);
+		expect(events.filter((event) => event.endTurn !== undefined)).toEqual([{ endTurn: false }]);
+		for (const event of events) {
+			const lane = { blockId: event.textBlockId, outputIndex: event.textOutputIndex };
+			if (event.text != null) content.append("text", event.text, lane);
+			if (event.textMetadata) [...content.textMetadata(event.textMetadata, lane)];
+			if (event.contentBoundary) [...content.boundary(event.contentBoundary)];
+		}
+		const blocks = content.orderedContent();
+		expect(blocks).toHaveLength(3);
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const history: unknown[] = [];
+		provider.pushAssistantTurn(
+			history,
+			"",
+			[],
+			undefined,
+			undefined,
+			"must-not-spread",
+			undefined,
+			undefined,
+			undefined,
+			blocks,
+		);
+		const stored = await provider.buildHistory(
+			[
+				makeAssistantMessage({
+					messageUuid: "must-not-spread",
+					contentJson: JSON.parse(JSON.stringify(blocks)),
+				}),
+			],
+			"gpt-5",
+		);
+		const expected = [
+			{
+				role: "assistant",
+				id: "msg_a",
+				phase: "partial_answer",
+				content: [
+					{ type: "output_text", text: " first " },
+					{ type: "output_text", text: "second" },
+				],
+			},
+			{
+				role: "assistant",
+				id: "msg_b",
+				phase: "final_answer",
+				content: [{ type: "output_text", text: "answer" }],
+			},
+		];
+		expect(history).toEqual(expected);
+		expect(stored.history).toEqual(expected);
+		expect(convertHistoryToResponsesApi(history as OAIMessage[])).toEqual(expected);
+	});
+
+	test("phase is message metadata, never response completion", () => {
+		const events = parseResponsesAPIEvent(
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "message", role: "assistant", id: "msg_final", phase: "final_answer" },
+			},
+			new Map(),
+			new Map(),
+		);
+		expect(events.some((event) => event.endTurn !== undefined || event.contentBoundary)).toBe(
+			false,
+		);
+	});
+
+	for (const endTurn of [true, false, undefined, "false", 0]) {
+		test(`end_turn=${String(endTurn)} is boolean-only and never drops tools`, () => {
+			const events = parseResponsesAPIEvent(
+				{
+					type: "response.completed",
+					response: {
+						status: "completed",
+						end_turn: endTurn,
+						output: [{ type: "function_call", call_id: "call_1", name: "Read", arguments: "{}" }],
+					},
+				},
+				new Map(),
+				new Map(),
+			);
+			expect(events.find((event) => event.toolUseChunk?.stop)?.toolUseChunk).toMatchObject({
+				toolUseId: "call_1",
+				stop: true,
+			});
+			expect(events.find((event) => event.endTurn !== undefined)?.endTurn).toBe(
+				typeof endTurn === "boolean" ? endTurn : undefined,
+			);
+		});
+	}
+
+	test("legacy text without native metadata keeps one UUID instead of copying it", () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const history: OAIMessage[] = [];
+		provider.pushAssistantTurn(
+			history,
+			"",
+			[],
+			undefined,
+			undefined,
+			"legacy-msg",
+			undefined,
+			undefined,
+			undefined,
+			[
+				{ type: "text", text: "one" },
+				{ type: "text", text: "two" },
+			],
+		);
+		expect(history.map((item) => item.id)).toEqual(["legacy-msg", undefined]);
+	});
+});
+
 describe("native Responses reasoning continuation", () => {
 	test("mock SSE round trip preserves metadata through aggregation, storage and the next request", async () => {
 		const provider = new OpenAIProvider({ ...TEST_PROVIDER, defaultModel: "deepseek-v4.1-flash" });
@@ -930,7 +1073,7 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
 		const historyJson = JSON.stringify(result.history);
 		expect(historyJson).toContain('"role":"developer"');
-		expect(historyJson).toContain(savedPath);
+		expect((result.history[0] as OAIMessage).content).toContain(savedPath);
 		expect(historyJson).toContain('"type":"image_generation_call"');
 		expect(historyJson).toContain('"id":"ig_saved"');
 		expect(historyJson).toContain('"revised_prompt":"a saved blue square"');

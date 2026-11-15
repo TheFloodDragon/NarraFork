@@ -135,6 +135,14 @@ describe.each([
 		const req = await capture(run);
 		const metadata = req.body.client_metadata as Record<string, string>;
 
+		expect(req.body.instructions).toBeUndefined();
+		expect((req.body.input as unknown[])[0]).toMatchObject({
+			type: "message",
+			role: "developer",
+			id: expect.stringMatching(/^msg_nf_instructions_/),
+			content: [{ type: "input_text", text: "You are a title generator." }],
+		});
+		expect(req.body.input).toHaveLength(2);
 		expect(req.body.tool_choice).toBe("auto");
 		// Parallel tool calls stay on outside the responses-lite contract.
 		expect(req.body.parallel_tool_calls).toBe(true);

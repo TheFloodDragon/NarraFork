@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { normalizePolicyViolationCode } from "@shared/agent-protocol/policy-violation";
 import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
 import { outputToText } from "@shared/agent-protocol/tool-output";
+import type { TextProviderMetadata } from "@shared/agent-protocol/types";
 import { historyInputMessageIds, modelTextFromContentBlocks } from "@shared/native-injection";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import {
@@ -18,8 +19,21 @@ import { getReasoningEffortBlocklist, parseModelId, settings } from "../settings
 import { readWithTimeout } from "../stream-timeout";
 import { getImagePath, imageToBase64 } from "../uploads";
 import { extractOpenAIUsage } from "../usage-tracking";
-import { getHttpCodexUserAgent, getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
+import {
+	getHttpCodexUserAgent,
+	getHttpUserAgent,
+	mergeExtraHeaders,
+	resolveClientFingerprint,
+	stripResponsesLiteHeader,
+} from "../user-agent";
 import { applyCodexStableRequestFields, createCodexRequestIdentity } from "./codex-request";
+import {
+	createProviderTurnContext,
+	extractCodexTurnStateFromEvent,
+	getCodexTurnState,
+	type ProviderTurnContext,
+	redactCodexTurnStateInJsonText,
+} from "./codex-turn-state";
 import {
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
@@ -59,6 +73,7 @@ import {
 import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { BoundedUtf8Capture, captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
+import { readSseFrames } from "./sse-frames";
 import { finalToolInput, ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import { resolveToolJsonSchema } from "./tool-registry";
 import {
@@ -454,6 +469,9 @@ interface ResponsesFunctionCallOutputMessage {
 
 export interface OAIMessage {
 	role: "system" | "user" | "assistant" | "tool";
+	/** Native Responses assistant message identity and continuation phase. */
+	id?: string;
+	phase?: NonNullable<TextProviderMetadata["openai"]>["phase"];
 	content?: string | OAIContentPart[] | null;
 	tool_calls?: OAIToolCall[];
 	tool_call_id?: string;
@@ -761,6 +779,10 @@ export class OpenAIProvider implements ProviderAdapter {
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		if (this.apiMode === "codex" && !params.turnContext) {
+			// Isolated direct calls still share one turn across WS → HTTP fallback.
+			params = { ...params, turnContext: createProviderTurnContext() };
+		}
 		// Use WebSocket mode for codex if enabled
 		if (this.useWebSocket) {
 			yield* this.chatCodexWebSocket(params);
@@ -890,6 +912,9 @@ export class OpenAIProvider implements ProviderAdapter {
 					identity: createCodexRequestIdentity(params.conversationId),
 					reasoningEffort: normalizedCodexReasoningEffort as string,
 				});
+				if (params.turnContext) {
+					(body.client_metadata as Record<string, string>).turn_id = params.turnContext.id;
+				}
 			} else {
 				// Plain Responses relays (apiMode "responses", e.g. NUG delegates):
 				// send the effort hint too. These used to get nothing at all, so
@@ -936,23 +961,22 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 
 		applyOpenAIModelMetadata(body, params.model, this.apiMode, params.maxOutputTokens);
-		const requestHeaders = this.buildHeaders(apiKey, params.conversationId);
-
-		// x-codex-turn-state is per-turn: the server hands it back on the first
-		// response of a turn and expects it replayed on every later request of
-		// that same turn (here: the strip-and-retry attempts below). codex-rs
-		// keeps it in a per-turn OnceLock and sends it as an HTTP header on this
-		// transport; the websocket path carries it in client_metadata instead
-		// (see applyTurnStateToRequest in codex-websocket.ts).
-		let turnState: string | null = null;
-
 		// One strip-and-retry for endpoints that reject an optional request field
 		// (observed: NUG Responses relays refusing `max_output_tokens`). Only safe
 		// before any stream event has been yielded — after that the consumer has
 		// already seen partial output and a silent re-send would duplicate it.
 		for (let attempt = 0; ; attempt++) {
-			if (turnState && this.apiMode === "codex") {
-				requestHeaders["x-codex-turn-state"] = turnState;
+			const requestHeaders = this.buildHeaders(apiKey, params.conversationId);
+			const turnState =
+				this.apiMode === "codex"
+					? getCodexTurnState(params.turnContext, {
+							baseUrl: endpoint,
+							credentialId: this.config.id,
+							headers: requestHeaders,
+						})
+					: undefined;
+			if (turnState?.value) {
+				mergeExtraHeaders(requestHeaders, { "x-codex-turn-state": turnState.value }, "User-Agent");
 			}
 			await reportInputCharacters(params, body);
 			const bodyText = JSON.stringify(body);
@@ -961,7 +985,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				method: "POST",
 				url: endpoint,
 				headers: sanitizeHeaders(requestHeaders),
-				bodyText,
+				body,
 			});
 
 			params.onRequestStart?.();
@@ -980,9 +1004,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 			// Capture the turn's sticky-routing token before status handling so
 			// even a non-2xx first response can seed the retried request.
-			if (this.apiMode === "codex" && !turnState) {
-				turnState = response.headers.get("x-codex-turn-state");
-			}
+			turnState?.capture(response.headers.get("x-codex-turn-state"));
 
 			params.requestDump?.setResponseMeta({
 				status: response.status,
@@ -998,7 +1020,14 @@ export class OpenAIProvider implements ProviderAdapter {
 				if (attempt === 0 && stripUnsupportedParameter(body, params.model, error)) continue;
 				throw error;
 			}
-			const capture = captureResponseStream(response.body, params.requestDump);
+			// Codex metadata frames contain an opaque routing token. Record decoded,
+			// redacted SSE frames instead of tapping the raw bytes before parsing.
+			const frameRecording =
+				this.apiMode === "codex" && response.ok ? params.requestDump : undefined;
+			const capture = captureResponseStream(
+				response.body,
+				frameRecording ? undefined : params.requestDump,
+			);
 			let yieldedEvent = false;
 			try {
 				if (!response.ok) {
@@ -1018,7 +1047,11 @@ export class OpenAIProvider implements ProviderAdapter {
 					throw error;
 				}
 				if (usesResponsesEndpoint(this.apiMode)) {
-					for await (const evt of _parseResponsesAPIStream(capture.stream)) {
+					for await (const evt of _parseResponsesAPIStream(capture.stream, {
+						drainUntilEof: this.config.drainUntilEof,
+						onCodexTurnState: turnState?.capture,
+						frameRecording,
+					})) {
 						// A field-rejection can arrive as HTTP 200 + SSE error. Throw before
 						// any consumer-visible event so the outer strip-and-retry can run;
 						// after content starts, a silent re-send would duplicate output.
@@ -1076,7 +1109,7 @@ export class OpenAIProvider implements ProviderAdapter {
 	private async *parseSSEStreamWithDetection(
 		body: ReadableStream<Uint8Array>,
 	): AsyncGenerator<ParsedStreamEvent> {
-		for await (const evt of parseSSEStream(body)) {
+		for await (const evt of parseSSEStream(body, this.config)) {
 			if (evt._responsesApi && this.apiMode === "codex") {
 				logger.debug("Codex gateway confirmed Responses API format");
 			}
@@ -1256,6 +1289,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				store: false,
 			};
 			const codexIdentity = this.apiMode === "codex" ? createCodexRequestIdentity() : undefined;
+			const turnContext = codexIdentity ? createProviderTurnContext() : undefined;
 			if (systemInstruction) {
 				body.instructions = systemInstruction;
 			} else if (this.apiMode === "codex") {
@@ -1274,10 +1308,9 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
 			const conversationId = codexIdentity?.conversationId;
-			// Per-turn x-codex-turn-state slot: the fallback retry below is a later
-			// request of the SAME turn and must replay the token the first
-			// response handed back (codex-rs sends it as an HTTP header here).
-			const turnState: { value: string | null } = { value: null };
+			if (turnContext) {
+				(body.client_metadata as Record<string, string>).turn_id = turnContext.id;
+			}
 			return withUnsupportedParameterFallback(model, body, (retryBody) =>
 				this.requestResponsesTextWithMeta(
 					baseUrl,
@@ -1286,7 +1319,7 @@ export class OpenAIProvider implements ProviderAdapter {
 					options?.signal,
 					options,
 					conversationId,
-					turnState,
+					turnContext,
 				),
 			);
 		}
@@ -1352,6 +1385,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				store: false,
 			};
 			const codexIdentity = this.apiMode === "codex" ? createCodexRequestIdentity() : undefined;
+			const turnContext = codexIdentity ? createProviderTurnContext() : undefined;
 			// Responses and Codex lightweight generation always use the streaming API.
 			body.stream = true;
 			if (codexIdentity) {
@@ -1364,10 +1398,9 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
 			const conversationId = codexIdentity?.conversationId;
-			// Per-turn x-codex-turn-state slot: the fallback retry below is a later
-			// request of the SAME turn and must replay the token the first
-			// response handed back (codex-rs sends it as an HTTP header here).
-			const turnState: { value: string | null } = { value: null };
+			if (turnContext) {
+				(body.client_metadata as Record<string, string>).turn_id = turnContext.id;
+			}
 			return withUnsupportedParameterFallback(model, body, (retryBody) =>
 				this.requestResponsesTextWithMeta(
 					baseUrl,
@@ -1376,7 +1409,7 @@ export class OpenAIProvider implements ProviderAdapter {
 					options?.signal,
 					options,
 					conversationId,
-					turnState,
+					turnContext,
 				),
 			);
 		}
@@ -1405,14 +1438,22 @@ export class OpenAIProvider implements ProviderAdapter {
 		signal?: AbortSignal,
 		options?: GenerateOptions,
 		conversationId?: string,
-		turnState?: { value: string | null },
+		turnContext?: ProviderTurnContext,
 	): Promise<GenerateMetaResult> {
 		if (body.stream !== true) {
 			throw new Error("OpenAI lightweight Responses generation requires stream=true");
 		}
 		const headers = this.buildHeaders(apiKey, conversationId);
-		if (turnState?.value && this.apiMode === "codex") {
-			headers["x-codex-turn-state"] = turnState.value;
+		const turnState =
+			this.apiMode === "codex"
+				? getCodexTurnState(turnContext, {
+						baseUrl: `${baseUrl}/responses`,
+						credentialId: this.config.id,
+						headers,
+					})
+				: undefined;
+		if (turnState?.value) {
+			mergeExtraHeaders(headers, { "x-codex-turn-state": turnState.value }, "User-Agent");
 		}
 		const response = await this.pfetch(`${baseUrl}/responses`, {
 			method: "POST",
@@ -1422,9 +1463,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		});
 		// Capture the turn's sticky-routing token before status handling so even
 		// a non-2xx first response can seed the retried request.
-		if (turnState && this.apiMode === "codex" && !turnState.value) {
-			turnState.value = response.headers.get("x-codex-turn-state");
-		}
+		turnState?.capture(response.headers.get("x-codex-turn-state"));
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
 			throw createOpenAIApiError(response, errText);
@@ -1461,7 +1500,10 @@ export class OpenAIProvider implements ProviderAdapter {
 		let text = "";
 		let usage: GenerateMetaResult["usage"] = null;
 		let outputTruncated = false;
-		for await (const evt of _parseResponsesAPIStream(response.body)) {
+		for await (const evt of _parseResponsesAPIStream(response.body, {
+			drainUntilEof: this.config.drainUntilEof,
+			onCodexTurnState: turnState?.capture,
+		})) {
 			if (evt.text) {
 				text += evt.text;
 				await options?.onTextDelta?.(evt.text);
@@ -1551,7 +1593,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		let text = "";
 		let usage: GenerateMetaResult["usage"] = null;
 		let outputTruncated = false;
-		for await (const evt of parseSSEStream(response.body)) {
+		for await (const evt of parseSSEStream(response.body, this.config)) {
 			if (evt.text) {
 				text += evt.text;
 				await options?.onTextDelta?.(evt.text);
@@ -1624,19 +1666,27 @@ export class OpenAIProvider implements ProviderAdapter {
 		// OpenCode Go serves both OpenAI shapes (/zen/go/v1/responses and
 		// /chat/completions) and reads session identity only from its own header,
 		// so it has to be added here rather than carried by the request body.
-		Object.assign(
+		mergeExtraHeaders(
 			headers,
 			buildOpencodeSessionHeader({
 				baseUrl: this.config.baseUrl,
 				conversationId,
 				extraHeaders: this.config.extraHeaders,
 			}),
+			"User-Agent",
 		);
-		// Emulated codex headers + user-configured extra headers (user wins).
-		Object.assign(headers, fingerprint.headers);
+		// Fingerprint/user overrides win over defaults, regardless of header casing.
+		mergeExtraHeaders(headers, fingerprint.headers, "User-Agent");
 		// Runtime-dynamic headers last (e.g. the NUG client-relay channel id,
 		// which rotates on every relay reconnect and must be read per request).
-		Object.assign(headers, this.config.dynamicHeaders?.() ?? {});
+		mergeExtraHeaders(headers, this.config.dynamicHeaders?.(), "User-Agent");
+		stripResponsesLiteHeader(headers);
+		if (this.apiMode === "codex") {
+			// Routing state is owned by the current turn and credential, not extraHeaders.
+			for (const key of Object.keys(headers)) {
+				if (key.toLowerCase() === "x-codex-turn-state") delete headers[key];
+			}
+		}
 		return headers;
 	}
 
@@ -1669,6 +1719,9 @@ export class OpenAIProvider implements ProviderAdapter {
 		const request = this.buildCodexWebSocketRequest(params);
 		const sessionKey = params.stickySessionKey ?? params.conversationId;
 		const fingerprint = this.resolveFingerprint(params.conversationId);
+		const extraHeaders = { ...fingerprint.headers };
+		mergeExtraHeaders(extraHeaders, this.config.dynamicHeaders?.(), "User-Agent");
+		stripResponsesLiteHeader(extraHeaders);
 
 		try {
 			await reportInputCharacters(params, request);
@@ -1681,6 +1734,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				proxy: this.proxy,
 				sessionKey,
 				conversationId: params.conversationId,
+				turnContext: params.turnContext,
 				narratorId: params.stickySessionKey,
 				credentialId: this.config.id,
 				model: params.model,
@@ -1688,7 +1742,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				signal: params.signal,
 				resetSessionBeforeRequest: params.resetUpstreamSession,
 				userAgent: fingerprint.userAgent,
-				extraHeaders: fingerprint.headers,
+				extraHeaders,
 				requestDump: params.requestDump,
 			})) {
 				yield stampReasoningSource(event, this.getActiveReasoningSource());
@@ -1789,6 +1843,9 @@ export class OpenAIProvider implements ProviderAdapter {
 			identity: createCodexRequestIdentity(params.conversationId),
 			reasoningEffort: resolveCodexRequestReasoningEffort(params.model, params.reasoningEffort),
 		});
+		if (params.turnContext) {
+			(request.client_metadata as Record<string, string>).turn_id = params.turnContext.id;
+		}
 		if (params.serviceTier) {
 			request.service_tier = params.serviceTier;
 		}
@@ -1951,10 +2008,13 @@ export function stampReasoningSource(
  */
 async function* _parseResponsesAPIStream(
 	body: ReadableStream<Uint8Array>,
+	options: {
+		drainUntilEof?: boolean;
+		onCodexTurnState?: (value: string | null) => void;
+		frameRecording?: ChatParams["requestDump"];
+	} = {},
 ): AsyncGenerator<ParsedStreamEvent> {
-	const decoder = new TextDecoder();
-	let buffer = "";
-	let lineCount = 0;
+	let frameCount = 0;
 	let sawResponsesEvent = false;
 	let completed = false;
 	let completionLimited = false;
@@ -1965,8 +2025,6 @@ async function* _parseResponsesAPIStream(
 	const toolAccum = new Map<number, ResponsesToolAccum>();
 	// Reasoning item accumulators keyed by output_index
 	const reasoningAccum = new Map<number, ResponsesReasoningAccum>();
-	// Track SSE event: type for gateway-injected events
-	let currentEventType = "";
 
 	const parsePayload = (payload: string, eventType: string): ParsedStreamEvent[] => {
 		if (!payload || payload === "[DONE]") return [];
@@ -1977,7 +2035,7 @@ async function* _parseResponsesAPIStream(
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 				lastParseError = {
 					error: "SSE data was not a JSON object",
-					preview: payload.slice(0, 300),
+					preview: redactCodexTurnStateInJsonText(payload.slice(0, 300)),
 				};
 				return [];
 			}
@@ -1985,7 +2043,7 @@ async function* _parseResponsesAPIStream(
 		} catch (err) {
 			lastParseError = {
 				error: err instanceof Error ? err.message : String(err),
-				preview: payload.slice(0, 300),
+				preview: redactCodexTurnStateInJsonText(payload.slice(0, 300)),
 			};
 			return [];
 		}
@@ -2004,11 +2062,14 @@ async function* _parseResponsesAPIStream(
 		if (
 			eventType &&
 			typeof data.type !== "string" &&
-			(eventType.startsWith("response.") || eventType === "error")
+			(eventType.startsWith("response.") ||
+				eventType === "codex.response.metadata" ||
+				eventType === "error")
 		) {
 			data.type = eventType;
 		}
 
+		options.onCodexTurnState?.(extractCodexTurnStateFromEvent(data));
 		const chunk = data as ResponsesAPIChunk;
 		const type = chunk.type;
 		if (typeof type === "string" && (type.startsWith("response.") || type === "error")) {
@@ -2021,92 +2082,56 @@ async function* _parseResponsesAPIStream(
 			if (isCompletionLimitReason(evt.invalidState.reason)) completionLimited = true;
 			else terminalError = true;
 		}
-		if (type === "response.completed") completed = true;
+		// parseResponsesAPIEvent has finalized tools and accounting before return.
+		if (type === "response.completed" && !events.some((evt) => evt.invalidState)) completed = true;
 		return events;
 	};
 
-	const reader = body.getReader();
+	let reachedEof = false;
+	options.frameRecording?.setResponseMeta({ bodyRecording: "redacted_sse_frames" });
 	try {
-		while (true) {
-			const { done, value } = await readWithTimeout(reader);
-			if (done) break;
-			buffer += decoder.decode(value, { stream: true });
-
-			const lines = buffer.split("\n");
-			buffer = lines.pop() ?? "";
-
-			for (const line of lines) {
-				const trimmed = line.trim();
-				if (!trimmed) {
-					currentEventType = "";
-					continue;
-				}
-				// Track SSE event: lines for gateway-injected events
-				if (trimmed.startsWith("event:")) {
-					currentEventType = trimmed.slice(6).trim();
-					continue;
-				}
-				if (!trimmed.startsWith("data:")) continue;
-
-				if (lineCount < 5) {
-					logger.debug("Responses API SSE line", {
-						lineIndex: lineCount,
-						preview: trimmed.slice(0, 300),
-					});
-				}
-				lineCount++;
-
-				const payload = trimmed.slice(5).trimStart();
-				const eventType = currentEventType;
-				currentEventType = "";
-				const events = parsePayload(payload, eventType);
-				for (const evt of events) {
-					yield evt;
-				}
-				if (terminalError) return;
+		for await (const frame of readSseFrames(body)) {
+			const safePayload = options.frameRecording
+				? redactCodexTurnStateInJsonText(frame.data)
+				: undefined;
+			if (safePayload !== undefined) {
+				const eventLine = frame.event ? `event: ${frame.event}\n` : "";
+				options.frameRecording?.appendResponseText(
+					`${eventLine}data: ${safePayload.replaceAll("\n", "\ndata: ")}\n\n`,
+				);
 			}
-		}
-		// Process remaining buffer
-		if (buffer.trim()?.startsWith("data:")) {
-			const trimmed = buffer.trim();
-			const payload = trimmed.slice(5).trimStart();
-			const events = parsePayload(payload, currentEventType);
-			for (const evt of events) {
-				yield evt;
+			if (frameCount < 5) {
+				logger.debug("Responses API SSE frame", {
+					frameIndex: frameCount,
+					preview: (safePayload ?? redactCodexTurnStateInJsonText(frame.data.slice(0, 300))).slice(
+						0,
+						300,
+					),
+				});
 			}
+			frameCount++;
+			for (const evt of parsePayload(frame.data, frame.event)) yield evt;
+			// Breaking/returning closes readSseFrames, which cancels the upstream reader.
+			// Only the explicit NUG adapter opts into trailing metering until EOF.
+			if (terminalError || (completed && !options.drainUntilEof)) return;
 		}
-		if (terminalError || completionLimited) return;
-		if (!completed) {
-			const parseDetail = lastParseError
-				? ` Last malformed SSE data: ${lastParseError.error}; preview=${lastParseError.preview}`
-				: sawResponsesEvent
-					? ""
-					: " No Responses API events were parsed from the stream.";
-			yield {
-				invalidState: {
-					reason: "stream_closed_before_response_completed",
-					message: `Responses API stream closed before response.completed.${parseDetail}`,
-				},
-			};
-			return;
-		}
-		// Flush any un-emitted tool calls only after a completed response. Otherwise
-		// a truncated stream could execute a half-written tool call and hide the real failure.
-		for (const [, acc] of toolAccum) {
-			if (!acc.emitted) {
-				acc.emitted = true;
-				yield {
-					toolUseChunk: {
-						toolUseId: acc.callId,
-						name: acc.name,
-						stop: true,
-						outputIndex: acc.outputIndex,
-					},
-				};
-			}
-		}
+		reachedEof = true;
+		if (terminalError || completionLimited || completed) return;
+		const parseDetail = lastParseError
+			? ` Last malformed SSE data: ${lastParseError.error}; preview=${lastParseError.preview}`
+			: sawResponsesEvent
+				? ""
+				: " No Responses API events were parsed from the stream.";
+		yield {
+			invalidState: {
+				reason: "stream_closed_before_response_completed",
+				message: `Responses API stream closed before response.completed.${parseDetail}`,
+			},
+		};
 	} finally {
-		reader.releaseLock();
+		options.frameRecording?.finishResponseCapture(
+			reachedEof || (completed && !options.drainUntilEof),
+		);
 	}
 }
 
@@ -2230,10 +2255,38 @@ export interface ResponsesReasoningAccum {
 	completed?: boolean;
 }
 
+type ResponsesMessagePhase = NonNullable<TextProviderMetadata["openai"]>["phase"];
+
+function responsesMessagePhase(value: unknown): ResponsesMessagePhase {
+	return value === "commentary" || value === "partial_answer" || value === "final_answer"
+		? value
+		: undefined;
+}
+
+interface ResponsesItemIdentity {
+	key: string | number;
+	outputIndex?: number;
+	itemId?: string;
+	phase?: ResponsesMessagePhase;
+}
+
 interface ResponsesTextLane {
 	outputIndex?: number;
+	item: ResponsesItemIdentity;
+	contentIndex: number;
 	length: number;
 	completed?: boolean;
+}
+
+function responsesTextMetadata(lane: ResponsesTextLane): TextProviderMetadata | undefined {
+	if (!lane.item.itemId && !lane.item.phase) return undefined;
+	return {
+		openai: {
+			...(lane.item.itemId ? { itemId: lane.item.itemId } : {}),
+			contentIndex: lane.contentIndex,
+			...(lane.item.phase ? { phase: lane.item.phase } : {}),
+		},
+	};
 }
 
 // Keyed by the caller-owned, per-response accumulator (also used by Codex WS).
@@ -2242,7 +2295,7 @@ const responsesContentState = new WeakMap<
 	Map<number, ResponsesToolAccum>,
 	{
 		textLanes: Map<string, ResponsesTextLane>;
-		items: Map<string, { key: string | number; outputIndex?: number }>;
+		items: Map<string, ResponsesItemIdentity>;
 	}
 >();
 
@@ -2463,14 +2516,31 @@ export function parseResponsesAPIEvent(
 	const itemId = chunk.item_id ?? chunk.item?.id;
 	const indexAlias = chunk.output_index == null ? undefined : `index:${chunk.output_index}`;
 	const idAlias = typeof itemId === "string" ? `id:${itemId}` : undefined;
-	const identity = (idAlias ? items.get(idAlias) : undefined) ??
+	const identity: ResponsesItemIdentity = (idAlias ? items.get(idAlias) : undefined) ??
 		(indexAlias ? items.get(indexAlias) : undefined) ?? {
 			key: chunk.output_index ?? itemId ?? "unknown",
 			outputIndex: chunk.output_index,
 		};
+	const previousItemId = identity.itemId;
+	const previousPhase = identity.phase;
 	if (chunk.output_index != null) identity.outputIndex = chunk.output_index;
+	if (typeof itemId === "string" && itemId) identity.itemId = itemId;
+	const messagePhase = responsesMessagePhase(chunk.item?.phase);
+	if (messagePhase) identity.phase = messagePhase;
 	if (indexAlias) items.set(indexAlias, identity);
 	if (idAlias) items.set(idAlias, identity);
+	// Item identity/phase may arrive after individual parts have completed. Patch
+	// every known part, without interpreting final_answer as a lifecycle boundary.
+	if (identity.itemId !== previousItemId || identity.phase !== previousPhase) {
+		for (const [blockId, lane] of textLanes) {
+			if (lane.item !== identity) continue;
+			results.push({
+				textMetadata: responsesTextMetadata(lane),
+				textBlockId: blockId,
+				textOutputIndex: identity.outputIndex,
+			});
+		}
+	}
 	chunk = {
 		...chunk,
 		_contentItemKey: identity.key,
@@ -2478,17 +2548,33 @@ export function parseResponsesAPIEvent(
 	};
 	const emitText = (partChunk: ResponsesAPIChunk, text: string, delta: boolean) => {
 		const blockId = responsesBlockId(partChunk, "text");
-		const lane = textLanes.get(blockId) ?? { outputIndex: partChunk.output_index, length: 0 };
+		const lane = textLanes.get(blockId) ?? {
+			outputIndex: partChunk.output_index,
+			item: identity,
+			contentIndex: partChunk.content_index ?? 0,
+			length: 0,
+		};
 		textLanes.set(blockId, lane);
 		const suffix = delta ? text : text.slice(lane.length);
 		if (suffix && !lane.completed) {
 			lane.length += suffix.length;
-			results.push({ text: suffix, textOutputIndex: partChunk.output_index, textBlockId: blockId });
+			const textMetadata = responsesTextMetadata(lane);
+			results.push({
+				text: suffix,
+				textOutputIndex: partChunk.output_index,
+				textBlockId: blockId,
+				...(textMetadata ? { textMetadata } : {}),
+			});
 		}
 	};
 	const textBoundary = (partChunk: ResponsesAPIChunk, phase: "checkpoint" | "complete") => {
 		const blockId = responsesBlockId(partChunk, "text");
-		const lane = textLanes.get(blockId) ?? { outputIndex: partChunk.output_index, length: 0 };
+		const lane = textLanes.get(blockId) ?? {
+			outputIndex: partChunk.output_index,
+			item: identity,
+			contentIndex: partChunk.content_index ?? 0,
+			length: 0,
+		};
 		if (lane.completed) return;
 		textLanes.set(blockId, lane);
 		if (phase === "complete") lane.completed = true;
@@ -2562,11 +2648,7 @@ export function parseResponsesAPIEvent(
 			}
 			// Some relays omit content on item.done; finalize already-observed lanes too.
 			for (const [blockId, lane] of textLanes) {
-				if (
-					!lane.completed &&
-					chunk.output_index != null &&
-					lane.outputIndex === chunk.output_index
-				) {
+				if (!lane.completed && lane.item === identity) {
 					lane.completed = true;
 					results.push({
 						contentBoundary: {
@@ -3005,6 +3087,11 @@ export function parseResponsesAPIEvent(
 				acc.emitted = true;
 			}
 		}
+		// Only an explicit native boolean controls continuation. Message phase and
+		// response.completed alone say nothing about whether the logical turn ends.
+		if (typeof chunk.response?.end_turn === "boolean") {
+			results.push({ endTurn: chunk.response.end_turn });
+		}
 		// Note: usage is already extracted at the top of this function
 		return results;
 	}
@@ -3030,60 +3117,29 @@ interface ToolAccumEntry {
 
 async function* parseSSEStream(
 	body: ReadableStream<Uint8Array>,
+	options: { drainUntilEof?: boolean } = {},
 ): AsyncGenerator<ParsedStreamEvent> {
-	const decoder = new TextDecoder();
-	let buffer = "";
-	// Accumulate tool call chunks by index
 	const toolAccum = new Map<number, ToolAccumEntry>();
-	let lineCount = 0;
-	// Track SSE event: type for gateway-injected events
-	let currentEventType = "";
-
-	const reader = body.getReader();
-	try {
-		while (true) {
-			const { done, value } = await readWithTimeout(reader);
-			if (done) break;
-			buffer += decoder.decode(value, { stream: true });
-
-			const lines = buffer.split("\n");
-			buffer = lines.pop() ?? "";
-
-			for (const line of lines) {
-				// Track SSE event: lines for gateway-injected events
-				if (line.startsWith("event:")) {
-					currentEventType = line.slice(6).trim();
-					continue;
-				}
-				// Log first few SSE lines for debugging
-				if (lineCount < 5 && line.trim() && line.startsWith("data: ")) {
-					logger.debug("OpenAI SSE line", {
-						lineIndex: lineCount,
-						preview: line.slice(0, 300),
-					});
-				}
-				lineCount++;
-				const events = parseSSELine(line, toolAccum, currentEventType);
-				currentEventType = "";
-				for (const evt of events) {
-					yield evt;
-				}
-			}
+	let frameCount = 0;
+	for await (const frame of readSseFrames(body)) {
+		if (frameCount < 5) {
+			logger.debug("OpenAI SSE frame", {
+				frameIndex: frameCount,
+				preview: frame.data.slice(0, 300),
+			});
 		}
-		// Process any remaining data in the buffer after stream ends
-		if (buffer.trim()) {
-			const events = parseSSELine(buffer, toolAccum, "");
-			for (const evt of events) {
-				yield evt;
-			}
-		}
-		// Flush any remaining accumulated tool calls that weren't emitted
-		// (e.g. stream ended without a finish_reason chunk)
-		const remaining = flushToolAccum(toolAccum);
-		if (remaining) yield remaining;
-	} finally {
-		reader.releaseLock();
+		frameCount++;
+		// finish_reason is not the end of accounting: include_usage follows it.
+		// [DONE] is terminal except for NUG's explicitly enabled trailing metering.
+		if (frame.data.trim() === "[DONE]" && !options.drainUntilEof) break;
+		const events = parseSSEPayload(frame.data, toolAccum, frame.event);
+		for (const evt of events) yield evt;
+		if (events.some((evt) => evt.invalidState && !isCompletionLimitReason(evt.invalidState.reason)))
+			return;
 	}
+	// Keep compatible relay EOF flushing, including explicit empty-call handling.
+	const remaining = flushToolAccum(toolAccum);
+	if (remaining) yield remaining;
 }
 
 /** Drain un-emitted tool calls from the accumulator into a ParsedStreamEvent. */
@@ -3115,18 +3171,18 @@ function flushToolAccum(toolAccum: Map<number, ToolAccumEntry>): ParsedStreamEve
 	return toolUses.length > 0 ? { toolUses } : null;
 }
 
-function parseSSELine(
-	line: string,
+function parseSSEPayload(
+	payload: string,
 	toolAccum: Map<number, ToolAccumEntry>,
 	eventType?: string,
 ): ParsedStreamEvent[] {
-	const trimmed = line.trim();
-	if (!trimmed || trimmed === "data: [DONE]") return [];
-	if (!trimmed.startsWith("data: ")) return [];
+	if (!payload || payload.trim() === "[DONE]") return [];
 
 	let data: Record<string, unknown>;
 	try {
-		data = JSON.parse(trimmed.slice(6));
+		const parsed: unknown = JSON.parse(payload);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+		data = parsed as Record<string, unknown>;
 	} catch {
 		return [];
 	}
@@ -3139,22 +3195,17 @@ function parseSSELine(
 	const gwEvt = parseGatewayDataEvent(data);
 	if (gwEvt) return [gwEvt];
 
+	if (eventType === "error" && typeof data.type !== "string") data.type = "error";
 	const chunk = data as OAIStreamChunk;
 
-	// Handle error objects embedded in stream chunks
-	// (some providers send errors as {error: {message, type, code}} inside the SSE stream)
-	if (chunk.error) {
-		// `chunk.error.message` is absent when the payload used `detail`/`description`, or
-		// when `error` is itself the message string. Recovering the real text matters more
-		// than the shape it arrived in — the placeholder below tells the user nothing.
-		const envelope = parseUpstreamErrorEnvelope(data);
-		const msg = chunk.error.message || envelope?.message || "Unknown OpenAI API error";
-		const reason = String(chunk.error.code ?? chunk.error.type ?? envelope?.code ?? "api_error");
-		const statusCode =
-			chunk.error.statusCode ??
-			chunk.error.status_code ??
-			(typeof chunk.error.code === "number" ? chunk.error.code : undefined);
+	// Preserve bare, string-valued and event:-only error envelopes after framing.
+	const envelope = parseUpstreamErrorEnvelope(data);
+	if (envelope) {
+		const msg = envelope.message || "Unknown OpenAI API error";
+		const reason = envelope.code ?? "api_error";
+		const statusCode = envelope.statusCode;
 		return [
+			...(chunk.usage ? [{ usage: openAIUsageToParsedUsage(chunk.usage, toolAccum) }] : []),
 			{
 				invalidState: {
 					reason,
@@ -3875,7 +3926,7 @@ function buildResponsesAssistantItemsFromStoredContent(
 	preserveTextBlocks = false,
 ): OAIMessage[] {
 	type StoredAssistantBlock =
-		| { type: "text"; text?: string; outputIndex?: number }
+		| { type: "text"; text?: string; outputIndex?: number; providerMetadata?: TextProviderMetadata }
 		| {
 				type: "reasoning";
 				text?: string;
@@ -3911,7 +3962,21 @@ function buildResponsesAssistantItemsFromStoredContent(
 	const items: OAIMessage[] = [];
 	const textBuffer: string[] = [];
 	const consumedToolUseIds = new Set<string>();
-	let messageIdAvailable = msg.messageUuid ?? undefined;
+	// A response-level legacy UUID is not an identity for all its message items.
+	const hasNativeText = blocks.some(
+		(block) =>
+			block.type === "text" &&
+			!!(block as Extract<StoredAssistantBlock, { type: "text" }>).providerMetadata?.openai,
+	);
+	let messageIdAvailable = hasNativeText ? undefined : (msg.messageUuid ?? undefined);
+	let nativeText:
+		| {
+				key?: string;
+				itemId?: string;
+				phase?: ResponsesMessagePhase;
+				parts: Map<number, string>;
+		  }
+		| undefined;
 
 	const flushTextBuffer = () => {
 		const text = textBuffer.join("\n");
@@ -3921,13 +3986,45 @@ function buildResponsesAssistantItemsFromStoredContent(
 			items.push(item);
 			messageIdAvailable = undefined;
 		}
+		if (nativeText) {
+			items.push({
+				role: "assistant",
+				...(nativeText.itemId ? { id: nativeText.itemId } : {}),
+				...(nativeText.phase ? { phase: nativeText.phase } : {}),
+				content: [...nativeText.parts.entries()]
+					.sort(([a], [b]) => a - b)
+					.map(([, value]) => ({ type: "output_text" as const, text: value })),
+			});
+			nativeText = undefined;
+		}
 	};
 
 	for (const block of blocks) {
 		if (block.type === "text") {
 			if (typeof block.text === "string" && block.text.length > 0) {
-				textBuffer.push(block.text);
-				if (preserveTextBlocks) flushTextBuffer();
+				const textBlock = block as Extract<StoredAssistantBlock, { type: "text" }>;
+				const metadata = textBlock.providerMetadata?.openai;
+				if (metadata) {
+					const itemId = typeof metadata.itemId === "string" ? metadata.itemId : undefined;
+					const phase = responsesMessagePhase(metadata.phase);
+					const key =
+						itemId ||
+						(textBlock.outputIndex != null ? `output:${textBlock.outputIndex}` : undefined);
+					if (!key || nativeText?.key !== key || nativeText?.phase !== phase) flushTextBuffer();
+					nativeText ??= { key, itemId, phase, parts: new Map() };
+					const contentIndex =
+						Number.isSafeInteger(metadata.contentIndex) && (metadata.contentIndex as number) >= 0
+							? (metadata.contentIndex as number)
+							: 0;
+					nativeText.parts.set(
+						contentIndex,
+						(nativeText.parts.get(contentIndex) ?? "") + block.text,
+					);
+				} else {
+					if (nativeText) flushTextBuffer();
+					textBuffer.push(block.text);
+					if (preserveTextBlocks) flushTextBuffer();
+				}
 			}
 			continue;
 		}
@@ -4405,6 +4502,11 @@ export function convertHistoryToResponsesApi(
 	for (const msg of messages) {
 		// biome-ignore lint/suspicious/noExplicitAny: Responses API uses different message shapes
 		const m = msg as any;
+		const phase = responsesMessagePhase(m.phase);
+		const assistantMetadata = {
+			...(typeof m.id === "string" && m.id ? { id: m.id } : {}),
+			...(phase ? { phase } : {}),
+		};
 
 		if (m.role === "system") {
 			result.push({ role: "developer", content: m.content } as unknown as OAIMessage);
@@ -4462,7 +4564,7 @@ export function convertHistoryToResponsesApi(
 			const content =
 				typeof m.content === "string" ? [{ type: "output_text", text: m.content }] : m.content;
 			if (content) {
-				result.push({ role: "assistant", content } as unknown as OAIMessage);
+				result.push({ role: "assistant", ...assistantMetadata, content } as unknown as OAIMessage);
 			}
 
 			// 3. Output function_call items
@@ -4496,12 +4598,13 @@ export function convertHistoryToResponsesApi(
 				if (!merged) continue;
 				result.push({
 					role: "assistant",
+					...assistantMetadata,
 					content: [{ type: "output_text", text: merged }],
 				} as unknown as OAIMessage);
 				continue;
 			}
 			if (Array.isArray(content) && content.length > 0) {
-				result.push({ role: "assistant", content } as unknown as OAIMessage);
+				result.push({ role: "assistant", ...assistantMetadata, content } as unknown as OAIMessage);
 			} else if (fallback) {
 				result.push({
 					role: "assistant",
